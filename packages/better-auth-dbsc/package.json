@@ -1,6 +1,6 @@
 {
   "name": "better-auth-dbsc",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Device Bound Session Credentials (DBSC) plugin for Better Auth: bind sessions to a device key so stolen cookies stop working.",
   "keywords": [
     "better-auth",
