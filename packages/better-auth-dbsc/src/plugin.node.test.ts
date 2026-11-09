@@ -22,7 +22,7 @@ import type { DeviceKey } from "./__fixtures__/device-key";
 import type { DbscAlgorithm } from "./crypto/jwk";
 import type { DbscEvent, DbscOptions } from "./options";
 import { dbsc, dbscRefreshNeeded, dbscRefreshPage } from "./plugin";
-import { createSchema } from "./schema";
+import { createSchema, DBSC_MODEL } from "./schema";
 
 const AUTH_PREFIX = "/api/auth";
 /** Past the plugin's registration grace (requests in flight are let through). */
@@ -119,6 +119,52 @@ const completeRegistration = async (
   return { instructions, offer, startResponse };
 };
 
+const RANGE_OPERATORS = new Set(["lt", "lte", "gt", "gte"]);
+const WHERE_METHODS = [
+  "count",
+  "delete",
+  "deleteMany",
+  "findMany",
+  "findOne",
+  "incrementOne",
+  "update",
+  "updateMany",
+] as const;
+
+interface AdapterQuery {
+  model: string;
+  where?: { operator?: string }[];
+}
+
+/**
+ * Makes the adapter refuse plugin queries with more than one range condition,
+ * as index-only adapters (Convex, key-value stores) do. Better Auth's memory
+ * adapter accepts them, which would hide the problem.
+ */
+const enforceSingleRangeQueries = (context: { adapter: object }) => {
+  const adapter = context.adapter as unknown as Record<
+    string,
+    ((query: AdapterQuery) => Promise<unknown>) | undefined
+  >;
+  for (const method of WHERE_METHODS) {
+    const original = adapter[method]?.bind(adapter);
+    if (!original) {
+      continue;
+    }
+    adapter[method] = (query) => {
+      const ranges = (query.where ?? []).filter(
+        (clause) => clause.operator && RANGE_OPERATORS.has(clause.operator)
+      );
+      if (query.model === DBSC_MODEL && ranges.length > 1) {
+        return Promise.reject(
+          new Error(`${method} on ${query.model} has ${ranges.length} ranges`)
+        );
+      }
+      return original(query);
+    };
+  }
+};
+
 const setup = async (
   options: DbscOptions = {},
   authOptions: Partial<BetterAuthOptions> = {},
@@ -138,6 +184,7 @@ const setup = async (
       ...after,
     ],
   });
+  enforceSingleRangeQueries(await instance.auth.$context);
   const handler = (request: Request) => instance.auth.handler(request);
   const { email, password } = instance.testUser;
 

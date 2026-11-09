@@ -105,6 +105,8 @@ const REGISTRATION_GRACE_MS = 10 * 1000;
  * the session, so this only stretches its life by these seconds.
  */
 const BOUND_COOKIE_LEEWAY_MS = 30 * 1000;
+/** Each registration sweeps at most this many dead bindings. */
+const SWEEP_BATCH_SIZE = 100;
 /**
  * A session counts as created by this request when its `createdAt` is no
  * earlier than the request start minus this slack. Server-side calls without
@@ -369,6 +371,40 @@ const findBindingByTokenHash = (context: CookieContext, tokenHash: string) =>
     model: DBSC_MODEL,
     where: [{ field: "tokenHash", value: tokenHash }],
   });
+
+/**
+ * Deletes up to `SWEEP_BATCH_SIZE` bindings whose stored expiry is past and
+ * that nothing has touched since `lastPossibleUse`.
+ *
+ * Adapters backed only by indexes (Convex, key-value stores) accept one range
+ * condition per query, so the query selects on `expiresAt` alone and the
+ * `updatedAt` condition runs here. Keep every query in this plugin to a single
+ * range condition.
+ */
+const sweepDeadBindings = async (
+  context: AuthContext,
+  now: number,
+  lastPossibleUse: number
+) => {
+  const expired = await context.adapter.findMany<DbscSessionRecord>({
+    limit: SWEEP_BATCH_SIZE,
+    model: DBSC_MODEL,
+    sortBy: { direction: "asc", field: "expiresAt" },
+    where: [{ field: "expiresAt", operator: "lt", value: new Date(now) }],
+  });
+  const dead = expired
+    .filter(
+      (binding) => new Date(binding.updatedAt).getTime() < lastPossibleUse
+    )
+    .map((binding) => binding.id);
+  if (dead.length === 0) {
+    return;
+  }
+  await context.adapter.deleteMany({
+    model: DBSC_MODEL,
+    where: [{ field: "id", operator: "in", value: dead }],
+  });
+};
 
 /** Bindings younger than the registration grace still accept the cookie alone. */
 const inRegistrationGrace = (binding: DbscSessionRecord, now: number) =>
@@ -1219,21 +1255,11 @@ export const dbsc = (options?: DbscOptions) => {
         ctx.context.sessionConfig.expiresIn * MS_PER_SECOND -
         resolvedOptions.cookieMaxAgeMs -
         BOUND_COOKIE_LEEWAY_MS;
-      await ctx.context.adapter
-        .deleteMany({
-          model: DBSC_MODEL,
-          where: [
-            { field: "expiresAt", operator: "lt", value: new Date(now) },
-            {
-              field: "updatedAt",
-              operator: "lt",
-              value: new Date(lastPossibleUse),
-            },
-          ],
-        })
-        .catch((error: unknown) => {
+      await sweepDeadBindings(ctx.context, now, lastPossibleUse).catch(
+        (error: unknown) => {
           ctx.context.logger.warn("[dbsc] Could not sweep bindings", error);
-        });
+        }
+      );
 
       const dbscSessionId = createDbscSessionId();
       const created = await createBinding(ctx, {
