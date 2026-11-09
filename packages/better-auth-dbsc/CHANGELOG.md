@@ -1,5 +1,11 @@
 # better-auth-dbsc
 
+## 0.1.1
+
+### Patch Changes
+
+- [#4](https://github.com/helixnebulatech/better-auth-dbsc/pull/4) [`3fde539`](https://github.com/helixnebulatech/better-auth-dbsc/commit/3fde5392ed208b384570319b1867eb409d6f349d) Thanks [@helixnebulatech](https://github.com/helixnebulatech)! - Sweep dead bindings with one range condition per query, so the cleanup also runs on adapters that only query through indexes (such as Convex). It used to fail there with "cannot have more than one lower bound where clause" and never delete anything.
+
 ## 0.1.0
 
 ### Minor Changes
