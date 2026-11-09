@@ -15,4 +15,5 @@
 
 ## Reference material
 
+- [Cookie cache alternatives](./cookie-cache-alternatives.md): design note on `getCookieCache()` and device-bound sessions, and why the plugin documents the risk instead of dropping the cache.
 - [Protocol notes](./dbsc-spec-notes.md): a digest of the W3C editor's draft and Chrome's implementation, used to build the plugin. Read it before changing protocol code.
