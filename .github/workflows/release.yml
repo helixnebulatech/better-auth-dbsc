@@ -24,9 +24,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  TURBO_TELEMETRY_DISABLED: 1
-
 jobs:
   select-mode:
     if: github.repository == 'helixnebulatech/better-auth-dbsc'
