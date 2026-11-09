@@ -17,7 +17,7 @@
     },
     "packages/better-auth-dbsc": {
       "name": "better-auth-dbsc",
-      "version": "0.0.0",
+      "version": "0.1.0",
       "dependencies": {
         "@noble/ciphers": "^2.4.0",
         "@noble/curves": "^2.4.0",
