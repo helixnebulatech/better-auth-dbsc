@@ -32,7 +32,21 @@ export const auth = betterAuth({
 });
 ```
 
-Order matters. `dbsc()` must come after `bearer()`, `twoFactor()` and `crossDomain()`, and before `anonymous()` and `username()`. The plugin checks this at startup and throws if the order is wrong.
+### Plugin order
+
+Better Auth runs plugin hooks in the order of the `plugins` array. The position of `dbsc()` matters relative to five plugins:
+
+| Plugin | Where | Why |
+| --- | --- | --- |
+| `bearer()` | before `dbsc()` | It turns an `Authorization: Bearer` header into a session cookie. `dbsc()` must see that cookie to check it, or a stolen token of a bound session would pass. |
+| `crossDomain()` (Convex) | before `dbsc()` | Its hooks rebuild the headers from the request as sent, which would put back a cookie `dbsc()` refused. |
+| `twoFactor()` | before `dbsc()` | When the second factor is still pending, it deletes the session the password sign-in just created. `dbsc()` must see that, so it offers registration to the real session created after the second factor, not to a deleted one. |
+| `anonymous()` | after `dbsc()` | Its hooks read the session, so they would see a session before `dbsc()` refuses it. |
+| `username()` | after `dbsc()` | Same as `anonymous()`. |
+
+Every other plugin (`organization()`, `admin()`, `multiSession()`, `passkey()`, `emailOTP()`, `convex()`…) can go anywhere. Putting `dbsc()` last works unless you use `anonymous()` or `username()`.
+
+You do not have to remember this: `dbsc()` checks the order at startup and throws an error that names the plugin to move, for example `[dbsc] Place dbsc() after crossDomain() in plugins`.
 
 ## 3. Create the table
 
