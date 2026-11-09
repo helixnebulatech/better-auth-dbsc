@@ -1,0 +1,34 @@
+# Static analysis of the workflows themselves (template injection, excessive
+# permissions, unpinned actions, credential persistence...), as Better Auth does.
+name: GitHub Actions Security Analysis
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - ".github/zizmor.yml"
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/zizmor.yml"
+
+permissions: {}
+
+jobs:
+  zizmor:
+    if: github.event_name == 'push' || !github.event.pull_request.head.repo.fork
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      security-events: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1

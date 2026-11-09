@@ -1,0 +1,29 @@
+{
+  "name": "better-auth-dbsc-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "turbo run build",
+    "check-types": "turbo run check-types",
+    "test": "turbo run test",
+    "publint": "turbo run publint",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "changeset": "changeset",
+    "ci:version": "changeset version && bun install"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "1.0.1",
+    "@changesets/cli": "3.0.3",
+    "@types/node": "22.20.5",
+    "oxfmt": "0.77.0",
+    "oxlint": "1.92.0",
+    "turbo": "2.11.10",
+    "typescript": "7.0.2",
+    "ultracite": "8.1.1"
+  },
+  "packageManager": "bun@1.4.4"
+}
