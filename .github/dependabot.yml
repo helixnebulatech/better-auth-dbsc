@@ -1,0 +1,28 @@
+# Dependencies and actions are pinned to exact versions and commit SHAs;
+# Dependabot proposes the bumps. The 2-day cooldown matches
+# `minimumReleaseAge` in bunfig.toml: a compromised release has time to be
+# caught and pulled before it reaches this repository.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 2
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 2
+    versioning-strategy: increase
+    groups:
+      dependencies:
+        patterns:
+          - "*"
