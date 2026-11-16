@@ -71,12 +71,12 @@
     "@scure/base": "^2.4.0"
   },
   "devDependencies": {
-    "@better-auth/core": "1.7.18",
+    "@better-auth/core": "1.7.23",
     "@edge-runtime/vm": "5.0.0",
-    "@types/node": "22.20.5",
-    "better-auth": "1.7.18",
+    "@types/node": "26.6.6",
+    "better-auth": "1.7.23",
     "del-cli": "8.0.1",
-    "playwright": "1.65.0",
+    "playwright": "1.65.1",
     "publint": "0.3.25",
     "tsdown": "0.23.7",
     "tsrs": "0.23.0-ts7.1.0-beta",
