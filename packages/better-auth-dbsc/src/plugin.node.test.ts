@@ -3012,6 +3012,42 @@ describe("unbound marker", () => {
     expect(hasMarker(browser)).toBeTruthy();
   });
 
+  it("is not handed out on a cached lookup made while the session could still register", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    const token = await sessionToken(browser);
+    // The bearer check looks the binding up a second before markers are
+    // allowed, then waits two minutes for the session; the cookie check
+    // reuses that lookup.
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + MINUTE_MS - 1000);
+    const context = await instance.auth.$context;
+    const findSession = context.internalAdapter.findSession.bind(
+      context.internalAdapter
+    );
+    let held = false;
+    const slowSession = vi
+      .spyOn(context.internalAdapter, "findSession")
+      .mockImplementation((async (...args: Parameters<typeof findSession>) => {
+        if (!held) {
+          held = true;
+          vi.setSystemTime(Date.now() + 2 * MINUTE_MS);
+        }
+        return await findSession(...args);
+      }) as typeof findSession);
+    const read = await browser.fetch("/get-session", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    slowSession.mockRestore();
+    expect(held).toBeTruthy();
+    await expect(read.json()).resolves.toMatchObject({
+      user: expect.any(Object),
+    });
+    expect(hasMarker(browser)).toBeFalsy();
+    // A fresh lookup after the cutoff earns it.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
   it("a binding written after the registration deadline is rolled back", async () => {
     const { signIn, instance, events } = await setup();
     const { browser, response } = await signIn();
