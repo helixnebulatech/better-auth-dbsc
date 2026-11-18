@@ -15,6 +15,8 @@ const HKDF_SALT = utf8Encode("better-auth-dbsc");
 export interface DerivedKeys {
   /** HMAC key for the short-lived bound cookie. */
   readonly cookie: Uint8Array;
+  /** HMAC key for the marker cookie of a session found unbound. */
+  readonly unbound: Uint8Array;
   /** HMAC key for registration and refresh challenges. */
   readonly challenge: Uint8Array;
   /** XChaCha20-Poly1305 key for the session token stored with a binding. */
@@ -40,6 +42,7 @@ export const deriveKeys = (secret: string): DerivedKeys => {
     cookie: derive(ikm, "cookie"),
     ticket: derive(ikm, "registration-ticket"),
     tokenEncryption: derive(ikm, "token-encryption"),
+    unbound: derive(ikm, "unbound-marker"),
   };
   if (cache.size >= MAX_CACHED_SECRETS) {
     cache.clear();

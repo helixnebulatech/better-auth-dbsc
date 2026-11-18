@@ -35,6 +35,8 @@ Two cases need more than a header on the sign-in response:
 
 The plugin never offers twice. A second offer would make Chrome start a second registration with a second key while the first one is still running.
 
+The challenge in an offer is valid for 5 minutes, and a session can only register during its first 10 minutes (5 for a deferred offer to be collected, 5 for its challenge). After that it stays unbound until the next sign-in.
+
 ## 2. Registration: `POST /dbsc/start`
 
 The browser creates a key pair, signs the challenge with it and sends the proof (a `dbsc+jwt`). The plugin:
@@ -51,6 +53,9 @@ Chrome logs one cosmetic `NoSessionMatch` event when it receives that challenge;
 A before hook runs on every request that carries a Better Auth session cookie. If the session is bound, the request must also carry a valid bound cookie for that session. Otherwise the plugin removes the session cookies from the request, and the session reads as signed out for that request.
 
 - The bound cookie is an HMAC over the session token. It verifies without a database read.
+- A request without a valid bound cookie costs one indexed lookup in `dbscSession`: the plugin has to know whether the session is bound.
+- Once a session can no longer register (about 11 minutes after it was created) and that lookup finds no binding, the response sets an unbound marker cookie (`dbsc_unbound_<tag>`), also an HMAC over the session token, valid for 24 hours. Requests that carry it skip the lookup. A browser without DBSC therefore costs lookups only during the first minutes of a session, and then one a day.
+- The marker is only set on responses that reach the browser. A server-side `auth.api.getSession` that cannot set cookies keeps paying the lookup until a browser request to Better Auth has set the marker.
 - Requests sent while the registration was in flight are accepted for 10 seconds after the binding is created.
 - A bound cookie is accepted up to 30 seconds past its expiry, to cover requests already in flight during a refresh.
 
@@ -70,6 +75,14 @@ If the browser has no usable challenge, the plugin answers 403 with a fresh one,
 
 Signing out, revoking a session or letting it expire removes the binding. The plugin's session-delete hook deletes the row, and rows whose session is gone are ignored.
 
+Whenever a response expires a cookie that holds a session, the plugin also expires the bound cookie and the unbound marker of that session:
+
+- Better Auth expires the session cookie on `/sign-out`, when the current session is revoked (`/revoke-session`, `/revoke-sessions`), when the user is deleted (`/delete-user` and its emailed link), and when `/get-session` finds the session gone. A sign-in that `twoFactor()` holds for the second factor also expires the session cookie the browser had, so that session's DBSC cookies go too, even though the session itself stays valid.
+- `multiSession()` expires an account's `_multi-` cookie when `/multi-session/revoke` revokes it, when `/multi-session/set-active` finds it gone, when signing in again to the same account deletes its older session, and all of them on `/sign-out`.
+- When a response signs the browser in to another session (`/change-password` with `revokeOtherSessions`, a new sign-in), the plugin checks whether the old session still exists, with one read, and expires its DBSC cookies if it is gone or expired. Admin impersonation and switching accounts leave a living session behind, so its cookies stay.
+
+Apart from that one read on responses that replace the session, the plugin reads all this from the response, without a database read. Revoking another session leaves the current one's cookies alone. With `crossDomain()`, the cookies it already moved to `Set-Better-Auth-Cookie` count too. The plugin never hands out an unbound marker for a session the response ends.
+
 ## Browsers without DBSC
 
-Browsers that do not support DBSC ignore the registration header. Their sessions are never bound and work exactly as before. See [Browser support](./browser-support.md).
+Browsers that do not support DBSC ignore the registration header. Their sessions are never bound and work exactly as before; the unbound marker cookie keeps them from costing a lookup on every request. See [Browser support](./browser-support.md).

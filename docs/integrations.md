@@ -19,6 +19,8 @@ The plugin works with the Convex component, including `crossDomain()`. Cookies c
 
    The framework handlers of `@convex-dev/better-auth` already do this. Server-side `getToken()` forwards the whole `Cookie` header, so server rendering sees the bound cookie.
 
+`crossDomain()` hands every cookie to its client in `Set-Better-Auth-Cookie`, including the ones the plugin sets. When a response ends a session, the plugin finds the expired session cookie in that header too and expires the session's DBSC cookies there.
+
 The refresh endpoint updates the binding with `adapter.incrementOne`. Component versions without a native `incrementOne` fall back to Better Auth's compare-and-swap. This works, but costs extra round trips.
 
 ## Proxies and separate auth services
@@ -102,13 +104,14 @@ See the `scope` and `allowedRefreshInitiators` options in [Configuration](./conf
 
 ## Multi-session
 
-With Better Auth's `multiSession()` plugin, every signed-in account is bound and refreshed on its own, and each one spends Chrome's signing quota separately.
+With Better Auth's `multiSession()` plugin, every signed-in account is bound and refreshed on its own, and each one spends Chrome's signing quota separately. Place `multiSession()` before `dbsc()`; the plugin refuses to start otherwise. When an account's session ends (`/multi-session/revoke`, `/sign-out`, `/multi-session/set-active` finding it gone, or signing in again to an account already in the browser, which deletes its older session), its bound cookie is expired with it. Switching accounts keeps every account's bound cookie. `_multi-` cookies are matched the way `multiSession()` matches them, whatever their prefix.
 
 ## Other plugins
 
 | Plugin | Notes |
 | --- | --- |
 | `bearer()` | Place before `dbsc()`. Bearer tokens of bound sessions are refused without the bound cookie. |
+| `multiSession()` | Place before `dbsc()`. See [Multi-session](#multi-session). |
 | `twoFactor()` | Place before `dbsc()`. |
 | `crossDomain()` | Place before `dbsc()`. |
 | `anonymous()`, `username()` | Place after `dbsc()`: their hooks read the session. |

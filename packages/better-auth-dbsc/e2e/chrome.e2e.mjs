@@ -254,6 +254,41 @@ try {
   await thiefPage.goto(ORIGIN);
   const stolen = await fetchInPage(thiefPage, "/get-session");
   check(stolen.body === null, "stolen session cookie is refused elsewhere");
+
+  // Revoking every session expires the bound cookie with the session cookie.
+  const revoked = await fetchInPage(page, "/revoke-sessions", {});
+  check(revoked.status === 200, "revoke-sessions succeeds");
+  const cookiesAfterRevoke = await context.cookies();
+  check(
+    !cookiesAfterRevoke.some(
+      (cookie) =>
+        cookie.name === bound.name ||
+        cookie.name.endsWith("better-auth.session_token")
+    ),
+    "session and bound cookies expired on revoke"
+  );
+  // Chrome holds the next request for a refresh, the plugin answers 401 and
+  // Chrome ends its session: the request goes through, signed out.
+  const refreshesBeforeRevoke = refreshStatuses.length;
+  const afterRevoke = await Promise.race([
+    fetchInPage(page, "/get-session"),
+    sleep(10_000).then(() => ({ timedOut: true })),
+  ]);
+  check(
+    !afterRevoke.timedOut && afterRevoke.body === null,
+    "the next request completes, signed out"
+  );
+  const refreshesAfterRevoke = refreshStatuses.slice(refreshesBeforeRevoke);
+  check(
+    refreshesAfterRevoke.every((status) => status === 401),
+    `refreshes after the revoke are refused (${refreshesAfterRevoke.join(",") || "none"})`
+  );
+  await fetchInPage(page, "/get-session");
+  check(
+    refreshStatuses.length - refreshesBeforeRevoke ===
+      refreshesAfterRevoke.length,
+    "Chrome ended its session: no further refreshes"
+  );
 } catch (error) {
   console.error(error);
   console.error("events:", JSON.stringify(events, null, 2));

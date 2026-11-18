@@ -2,8 +2,8 @@
 
 ## Requirements
 
-- Better Auth 1.7.18 or later, with a database. Stateless sessions are not supported: the plugin stores one row per bound session.
-- Node.js 22 or later, or another runtime Better Auth supports (Bun, Cloudflare Workers, edge runtimes, Convex).
+- Better Auth 1.7.25 or later, with a database. Stateless sessions are not supported: the plugin stores one row per bound session.
+- Node.js 26 or later, or another runtime Better Auth supports (Bun, Cloudflare Workers, edge runtimes, Convex).
 - HTTPS in production. Chrome ignores DBSC headers on plain HTTP.
 
 ## 1. Install
@@ -34,17 +34,18 @@ export const auth = betterAuth({
 
 ### Plugin order
 
-Better Auth runs plugin hooks in the order of the `plugins` array. The position of `dbsc()` matters relative to five plugins:
+Better Auth runs plugin hooks in the order of the `plugins` array. The position of `dbsc()` matters relative to six plugins:
 
 | Plugin | Where | Why |
 | --- | --- | --- |
 | `bearer()` | before `dbsc()` | It turns an `Authorization: Bearer` header into a session cookie. `dbsc()` must see that cookie to check it, or a stolen token of a bound session would pass. |
 | `crossDomain()` (Convex) | before `dbsc()` | Its hooks rebuild the headers from the request as sent, which would put back a cookie `dbsc()` refused. |
+| `multiSession()` | before `dbsc()` | When it deletes an account's session (sign-out, signing in again to the same account), it expires that account's cookie in its after hook. `dbsc()` must see that to expire the session's bound cookie too. |
 | `twoFactor()` | before `dbsc()` | When the second factor is still pending, it deletes the session the password sign-in just created. `dbsc()` must see that, so it offers registration to the real session created after the second factor, not to a deleted one. |
 | `anonymous()` | after `dbsc()` | Its hooks read the session, so they would see a session before `dbsc()` refuses it. |
 | `username()` | after `dbsc()` | Same as `anonymous()`. |
 
-Every other plugin (`organization()`, `admin()`, `multiSession()`, `passkey()`, `emailOTP()`, `convex()`…) can go anywhere. Putting `dbsc()` last works unless you use `anonymous()` or `username()`.
+Every other plugin (`organization()`, `admin()`, `passkey()`, `emailOTP()`, `convex()`…) can go anywhere. Putting `dbsc()` last works unless you use `anonymous()` or `username()`.
 
 You do not have to remember this: `dbsc()` checks the order at startup and throws an error that names the plugin to move, for example `[dbsc] Place dbsc() after crossDomain() in plugins`.
 

@@ -39,7 +39,9 @@ Chrome refreshes when less than 120 seconds are left, and signs at most 6 proofs
 - **Default:** `cookieMaxAge + 300`
 - **Minimum:** `cookieMaxAge + 120`
 
-How long a challenge stays valid. The browser keeps the challenge from one refresh until the next, so a challenge must outlive the cookie.
+How long a refresh challenge stays valid. The browser keeps the challenge from one refresh until the next, so a challenge must outlive the cookie.
+
+Registration challenges do not use this option. They are valid for 5 minutes, because Chrome registers as soon as it receives the offer and that lifetime decides how long a session can still become bound.
 
 ## `registerOnGetSession`
 

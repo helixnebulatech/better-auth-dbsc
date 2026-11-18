@@ -11,6 +11,7 @@ import {
   getSessionFromCtx,
   sessionMiddleware,
 } from "better-auth/api";
+import { splitSetCookieHeader } from "better-auth/cookies";
 import { mergeSchema } from "better-auth/db";
 
 import {
@@ -56,12 +57,14 @@ import {
   createBoundCookieValue,
   createChallenge,
   createDbscSessionId,
+  createUnboundMarkerValue,
   decryptSessionToken,
   encryptSessionToken,
   openRegistrationTicket,
   sealRegistrationTicket,
   verifyBoundCookieValue,
   verifyChallenge,
+  verifyUnboundMarkerValue,
 } from "./tokens";
 import type { ChallengePurpose } from "./tokens";
 import { PACKAGE_VERSION } from "./version";
@@ -94,6 +97,12 @@ const DEFERRED_OFFER_TTL_MS = 5 * 60 * 1000;
 /** Lifetime of a registration ticket (`authorization`); Chrome uses it at once. */
 const REGISTRATION_TICKET_TTL_MS = 5 * 60 * 1000;
 /**
+ * Lifetime of a registration challenge. Chrome registers as soon as it gets
+ * the offer, so it is short, and not `challengeMaxAge`: it decides how long a
+ * session can still become bound (see `REGISTRATION_WINDOW_MS`).
+ */
+const REGISTRATION_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+/**
  * Requests the page sent while the registration was in flight arrive after
  * the binding exists but without the bound cookie. They are let through for
  * this long after the binding is created (dbsc-php does the same).
@@ -114,6 +123,28 @@ const SWEEP_BATCH_SIZE = 100;
  */
 const SESSION_CREATION_SLACK_MS = 1000;
 const SERVER_SIDE_CREATION_WINDOW_MS = 10 * 1000;
+/** No deferred offer exists for a session older than this. */
+const DEFERRED_OFFER_WINDOW_MS =
+  SERVER_SIDE_CREATION_WINDOW_MS + DEFERRED_OFFER_TTL_MS;
+/**
+ * A session older than this can no longer become bound. Its last offer was
+ * made within `DEFERRED_OFFER_WINDOW_MS` of its creation and the challenge in
+ * it has expired; `/dbsc/start` refuses it besides, so this holds whatever
+ * the offers do.
+ */
+const REGISTRATION_WINDOW_MS =
+  DEFERRED_OFFER_WINDOW_MS + REGISTRATION_CHALLENGE_TTL_MS;
+/**
+ * Wait between the end of the registration window and the first unbound
+ * marker. It covers clock differences between servers, a registration that
+ * passed the window check and is still writing its binding, and replica lag.
+ */
+const UNBOUND_MARKER_MARGIN_MS = 60 * 1000;
+/**
+ * Lifetime of an unbound marker. What it says stays true, so this only
+ * limits how long the marker of a replaced session lingers in the browser.
+ */
+const UNBOUND_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
 const TRAILING_SLASHES = /\/+$/u;
 
 /**
@@ -148,6 +179,7 @@ const DBSC_SESSION_ID_PATTERN = /^[\w-]{22}$/u;
  */
 const COOKIE_CARRIER_HEADERS = ["better-auth-cookie"] as const;
 const COOKIE_BASE_NAME = "dbsc";
+const UNBOUND_MARKER_BASE_NAME = "dbsc_unbound";
 const MS_PER_SECOND = 1000;
 /** Better Auth's default `session.cookieCache.maxAge`, in seconds. */
 const DEFAULT_COOKIE_CACHE_MAX_AGE = 300;
@@ -158,6 +190,10 @@ const PLUGINS_BEFORE_DBSC = {
   // @convex-dev/better-auth: its before hooks return headers rebuilt from
   // the request as sent, which would put back a cookie dbsc refused.
   "cross-domain": "crossDomain()",
+  // Its after hooks expire the `_multi-` cookies of sessions it deletes
+  // (sign-out, signing in again to the same account); dbsc's after hook
+  // must see them to expire those sessions' DBSC cookies.
+  "multi-session": "multiSession()",
   "two-factor": "twoFactor()",
 } as const;
 
@@ -262,6 +298,16 @@ const boundCookieIsValid = (
     verifyBoundCookieValue(keys, value, tokenHash, now - BOUND_COOKIE_LEEWAY_MS)
   );
 
+const unboundMarkerIsValid = (
+  ring: Keyring,
+  value: string,
+  tokenHash: string,
+  now: number
+) =>
+  ring.all.some((keys) =>
+    verifyUnboundMarkerValue(keys, value, tokenHash, now)
+  );
+
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -312,12 +358,24 @@ const takeDeferredOffer = async (ctx: WithContext, tokenHash: string) => {
 const isProtocolPath = (path: string | undefined) =>
   path === DBSC_PATHS.start || path === DBSC_PATHS.refresh;
 
-const tokenFromReturned = (returned: unknown): string | undefined => {
+const sessionFromReturned = (returned: unknown) => {
   if (typeof returned !== "object" || returned === null) {
     return;
   }
-  const { session } = returned as { session?: { token?: unknown } };
-  return typeof session?.token === "string" ? session.token : undefined;
+  const { session } = returned as {
+    session?: { createdAt?: unknown; token?: unknown };
+  };
+  if (typeof session?.token !== "string") {
+    return;
+  }
+  const { createdAt } = session;
+  return {
+    createdAt:
+      createdAt instanceof Date || typeof createdAt === "string"
+        ? new Date(createdAt).getTime()
+        : Number.NaN,
+    token: session.token,
+  };
 };
 
 const authPath = (ctx: WithContext, path: string) =>
@@ -328,11 +386,12 @@ const authPath = (ctx: WithContext, path: string) =>
  * settings, except Partitioned: DBSC credentials cannot be partitioned (ED
  * §8.9), so it is left out even when the app partitions its own cookies.
  */
-const boundCookieFor = (
+const sessionCookieFor = (
   context: CookieContext,
+  baseName: string,
   tokenHash: string
 ): BoundCookie => {
-  const base = context.createAuthCookie(COOKIE_BASE_NAME);
+  const base = context.createAuthCookie(baseName);
   return {
     attributes: {
       domain: base.attributes.domain || undefined,
@@ -344,6 +403,23 @@ const boundCookieFor = (
     name: `${base.name}_${cookieNameTag(tokenHash)}`,
   };
 };
+
+const boundCookieFor = (context: CookieContext, tokenHash: string) =>
+  sessionCookieFor(context, COOKIE_BASE_NAME, tokenHash);
+
+/**
+ * The marker cookie of a session that is unbound for good. Requests that
+ * carry it skip the binding lookup, so a browser without DBSC stops costing
+ * one read per request.
+ *
+ * It is a bearer value, so it must never be wrong: a marker that outlived a
+ * registration would let a copied session cookie through. It is therefore
+ * issued only when a lookup found no binding and the session is past
+ * `REGISTRATION_WINDOW_MS`, after which it cannot become bound. Until then
+ * every request without a bound cookie costs the lookup.
+ */
+const unboundMarkerFor = (context: CookieContext, tokenHash: string) =>
+  sessionCookieFor(context, UNBOUND_MARKER_BASE_NAME, tokenHash);
 
 /**
  * A refresh challenge for the session. It is issued strictly after
@@ -523,6 +599,91 @@ const readsMultiSessionCookies = (
   findMultiSession(context) !== undefined &&
   (path === SIGN_OUT_PATH || (path?.startsWith(MULTI_SESSION_PREFIX) ?? false));
 
+const EXPIRED_MAX_AGE_PATTERN = /;\s*max-age=(?:0|-\d+)\s*(?:;|$)/iu;
+
+/**
+ * crossDomain() (@convex-dev/better-auth) moves the cookies set before its
+ * after hook to this header, comma-joined; its client applies them first,
+ * then any Set-Cookie added later.
+ */
+const CROSS_DOMAIN_SET_COOKIE_HEADER = "set-better-auth-cookie";
+
+/**
+ * The Set-Cookie headers of this response so far, one per name: the last one
+ * counts, as in a browser, so a cookie that is expired and then set again
+ * (admin impersonation replacing the session) is not expired. Cookies
+ * crossDomain() already moved to `Set-Better-Auth-Cookie` come first, the
+ * order in which its client applies them. Like Better Auth, this falls back
+ * to the joined header on runtimes without `Headers.getSetCookie`.
+ */
+const responseSetCookies = (ctx: HookEndpointContext) => {
+  const headers = ctx.context.responseHeaders;
+  const set =
+    typeof headers?.getSetCookie === "function"
+      ? headers.getSetCookie()
+      : splitSetCookieHeader(headers?.get("set-cookie") ?? "");
+  const last = new Map<string, string>();
+  for (const entry of [
+    ...splitSetCookieHeader(headers?.get(CROSS_DOMAIN_SET_COOKIE_HEADER) ?? ""),
+    ...set,
+  ]) {
+    last.set(entry.slice(0, entry.indexOf("=")).trim(), entry);
+  }
+  return last;
+};
+
+type ResponseSetCookies = ReturnType<typeof responseSetCookies>;
+
+const isExpiry = (entry: string | undefined) =>
+  entry !== undefined && EXPIRED_MAX_AGE_PATTERN.test(entry);
+
+/**
+ * What the response does to the session cookie: nothing, expire it, or set
+ * it to the session `token` (unverified: the response's own cookie).
+ */
+const nextSessionCookie = (
+  ctx: HookEndpointContext,
+  setCookies: ResponseSetCookies
+): { expired: boolean; token?: string } => {
+  const entry = setCookies.get(ctx.context.authCookies.sessionToken.name);
+  if (entry === undefined) {
+    return { expired: false };
+  }
+  if (isExpiry(entry)) {
+    return { expired: true };
+  }
+  const valueEnd = entry.indexOf(";");
+  const value = entry
+    .slice(entry.indexOf("=") + 1, valueEnd === -1 ? undefined : valueEnd)
+    .trim();
+  return { expired: false, token: readSignedCookieToken(value) ?? "" };
+};
+
+/**
+ * The request cookies holding sessions that this response ends. Better Auth
+ * expires the session cookie on sign-out, when the current session is
+ * revoked or found dead, when its user is deleted, and on a sign-in that
+ * waits for twoFactor(). multiSession() (listed before dbsc(), so its after
+ * hooks have run) expires the `_multi-` cookie of every session it deletes
+ * or finds dead. `_multi-` cookies are matched the way multiSession()
+ * matches them.
+ */
+const sessionCookiesEndedByResponse = (
+  ctx: HookEndpointContext,
+  setCookies: ResponseSetCookies
+) => {
+  const sessionCookieName = ctx.context.authCookies.sessionToken.name;
+  const holdsSession = (name: string) =>
+    name === sessionCookieName || name.includes(MULTI_SESSION_COOKIE_MARKER);
+  const ended = new Set<string>();
+  for (const [name, entry] of setCookies) {
+    if (holdsSession(name) && isExpiry(entry)) {
+      ended.add(name);
+    }
+  }
+  return ended;
+};
+
 /**
  * How many multi-session cookies a request may carry: one per session
  * multiSession() keeps, plus the one being added. Beyond that they are
@@ -668,7 +829,12 @@ const refreshNeededFor = async (
   const tokenHash = hashToken(token);
   const now = Date.now();
   const bound = cookies.get(boundCookieFor(context, tokenHash).name);
-  if (bound && boundCookieIsValid(keyringFor(context), bound, tokenHash, now)) {
+  const ring = keyringFor(context);
+  if (bound && boundCookieIsValid(ring, bound, tokenHash, now)) {
+    return false;
+  }
+  const marker = cookies.get(unboundMarkerFor(context, tokenHash).name);
+  if (marker && unboundMarkerIsValid(ring, marker, tokenHash, now)) {
     return false;
   }
   const binding = await findBindingByTokenHash(context, tokenHash);
@@ -737,6 +903,11 @@ export const dbsc = (options?: DbscOptions) => {
     Request,
     Map<string, Promise<DbscSessionRecord | null>>
   >();
+  /**
+   * The session tokens a request's lookups found unbound, from the before
+   * hook to the after hook, which knows the session's age.
+   */
+  const foundUnboundByRequest = new WeakMap<Headers, Set<string>>();
   /** When each HTTP request reached the plugin, to tell new sessions apart. */
   const requestStarts = new WeakMap<Request, number>();
 
@@ -797,28 +968,37 @@ export const dbsc = (options?: DbscOptions) => {
   };
 
   /**
-   * True when the token may be used for this request: its session is not
-   * device-bound, the request carries a valid bound cookie for it, or the
-   * binding was created moments ago (requests already in flight). The bound
-   * cookie verifies offline, so DBSC browsers cost no reads.
+   * Whether the token may be used for this request. It may when the request
+   * carries a valid bound cookie for it, when its session is not device-bound,
+   * or when the binding was created moments ago (requests already in flight).
+   * The bound cookie and the unbound marker verify offline, so only a request
+   * carrying neither costs a read; `found-unbound` is that read finding no
+   * binding.
    */
-  const mayUseToken = async (
+  const checkToken = async (
     ctx: HookEndpointContext,
     cookies: Map<string, string>,
     ring: Keyring,
     token: string
-  ): Promise<boolean> => {
+  ): Promise<"allowed" | "found-unbound" | "refused"> => {
     const tokenHash = hashToken(token);
     const now = Date.now();
     const boundCookie = cookies.get(
       boundCookieFor(ctx.context, tokenHash).name
     );
     if (boundCookie && boundCookieIsValid(ring, boundCookie, tokenHash, now)) {
-      return true;
+      return "allowed";
+    }
+    const marker = cookies.get(unboundMarkerFor(ctx.context, tokenHash).name);
+    if (marker && unboundMarkerIsValid(ring, marker, tokenHash, now)) {
+      return "allowed";
     }
     const binding = await findBinding(ctx, "tokenHash", tokenHash);
-    if (!binding || inRegistrationGrace(binding, now)) {
-      return true;
+    if (!binding) {
+      return "found-unbound";
+    }
+    if (inRegistrationGrace(binding, now)) {
+      return "allowed";
     }
     await emit(ctx, {
       path: ctx.path,
@@ -826,8 +1006,15 @@ export const dbsc = (options?: DbscOptions) => {
       type: "proof-missing",
       userId: binding.userId,
     });
-    return false;
+    return "refused";
   };
+
+  const mayUseToken = async (
+    ctx: HookEndpointContext,
+    cookies: Map<string, string>,
+    ring: Keyring,
+    token: string
+  ) => (await checkToken(ctx, cookies, ring, token)) !== "refused";
 
   /* ------------------------------------------------------------------------ */
   /* Enforcement                                                              */
@@ -857,8 +1044,11 @@ export const dbsc = (options?: DbscOptions) => {
     );
   };
 
-  /** Checks each token once; returns those the request may not use. */
-  const refusedTokens = async (
+  /**
+   * Checks each token once; returns those the request may not use and those
+   * a lookup found unbound.
+   */
+  const checkTokens = async (
     ctx: HookEndpointContext,
     cookies: Map<string, string>,
     ring: Keyring,
@@ -868,14 +1058,18 @@ export const dbsc = (options?: DbscOptions) => {
       [...tokensByName.values()].flatMap((tokens) => [...tokens])
     );
     const refused = new Set<string>();
+    const foundUnbound = new Set<string>();
     await Promise.all(
       [...unique].map(async (token) => {
-        if (!(await mayUseToken(ctx, cookies, ring, token))) {
+        const verdict = await checkToken(ctx, cookies, ring, token);
+        if (verdict === "refused") {
           refused.add(token);
+        } else if (verdict === "found-unbound") {
+          foundUnbound.add(token);
         }
       })
     );
-    return refused;
+    return { foundUnbound, refused };
   };
 
   const enforce = createAuthMiddleware(async (ctx) => {
@@ -914,7 +1108,15 @@ export const dbsc = (options?: DbscOptions) => {
       sessionCookieName,
       sources,
     });
-    const refused = await refusedTokens(ctx, cookies, ring, tokensByName);
+    const { foundUnbound, refused } = await checkTokens(
+      ctx,
+      cookies,
+      ring,
+      tokensByName
+    );
+    if (foundUnbound.size > 0) {
+      foundUnboundByRequest.set(headers, foundUnbound);
+    }
     const dropped = new Set(overLimit);
     for (const [name, tokens] of tokensByName) {
       if ([...tokens].some((token) => refused.has(token))) {
@@ -1078,42 +1280,151 @@ export const dbsc = (options?: DbscOptions) => {
     ) {
       return;
     }
-    const token = tokenFromReturned(ctx.context.returned);
-    if (!token) {
+    const session = sessionFromReturned(ctx.context.returned);
+    // Skipped without a read once the offer's lifetime is over, which is
+    // nearly every `/get-session` of a session.
+    if (!session || session.createdAt + DEFERRED_OFFER_WINDOW_MS < Date.now()) {
       return;
     }
-    const tokenHash = hashToken(token);
+    const tokenHash = hashToken(session.token);
     if (await takeDeferredOffer(ctx, tokenHash)) {
       setRegistrationHeader(ctx, tokenHash);
     }
   };
 
-  const offerRegistration = createAuthMiddleware(async (ctx) => {
+  /**
+   * Hands the browser an unbound marker once its session can no longer
+   * become bound. It only uses the lookup the before hook made for this
+   * request, so it never reads on its own.
+   */
+  const issueUnboundMarker = (
+    ctx: OfferContext,
+    endedTokens: ReadonlySet<string>
+  ) => {
+    const session = ctx.context.session?.session;
+    if (
+      !(
+        session &&
+        // Not for a session this response ends.
+        !endedTokens.has(session.token) &&
+        ctx.headers &&
+        foundUnboundByRequest.get(ctx.headers)?.has(session.token)
+      )
+    ) {
+      return;
+    }
+    const now = Date.now();
+    const markerAllowedAt =
+      new Date(session.createdAt).getTime() +
+      REGISTRATION_WINDOW_MS +
+      UNBOUND_MARKER_MARGIN_MS;
+    // Also false for a session without a usable creation time.
+    if (!(markerAllowedAt < now)) {
+      return;
+    }
+    const tokenHash = hashToken(session.token);
+    const { name, attributes } = unboundMarkerFor(ctx.context, tokenHash);
+    ctx.setCookie(
+      name,
+      createUnboundMarkerValue(
+        keyringFor(ctx.context).current,
+        tokenHash,
+        now + UNBOUND_MARKER_TTL_MS
+      ),
+      {
+        domain: attributes.domain,
+        httpOnly: attributes.httpOnly,
+        maxAge: UNBOUND_MARKER_TTL_MS / MS_PER_SECOND,
+        path: attributes.path,
+        sameSite: attributes.sameSite,
+        secure: attributes.secure,
+      }
+    );
+  };
+
+  /**
+   * The tokens of the sessions this response ends, read from the request's
+   * signed cookies that the response expires. No database read.
+   */
+  const endedSessionTokens = async (
+    ctx: OfferContext,
+    setCookies: ResponseSetCookies
+  ) => {
+    const tokens = new Set<string>();
+    for (const name of sessionCookiesEndedByResponse(ctx, setCookies)) {
+      // oxlint-disable-next-line eslint/no-await-in-loop -- HMAC only, few cookies.
+      const token = await ctx.getSignedCookie(name, ctx.context.secret);
+      if (token) {
+        tokens.add(token);
+      }
+    }
+    const replaced = await replacedSessionToken(ctx, setCookies);
+    if (replaced !== undefined && !tokens.has(replaced)) {
+      // The response signs the browser in to another session. The old one
+      // may be gone (`/change-password` with revokeOtherSessions) or still
+      // alive (admin impersonation, switching accounts): only the store
+      // knows. One read, and only on responses that replace the session.
+      const found = await ctx.context.internalAdapter.findSession(replaced);
+      if (
+        !found ||
+        !(new Date(found.session.expiresAt).getTime() > Date.now())
+      ) {
+        tokens.add(replaced);
+      }
+    }
+    return tokens;
+  };
+
+  /** The request's session token, when the response sets another one. */
+  const replacedSessionToken = async (
+    ctx: OfferContext,
+    setCookies: ResponseSetCookies
+  ) => {
+    const next = nextSessionCookie(ctx, setCookies);
+    if (next.token === undefined) {
+      return;
+    }
+    const current = await ctx.getSignedCookie(
+      ctx.context.authCookies.sessionToken.name,
+      ctx.context.secret
+    );
+    return current && current !== next.token ? current : undefined;
+  };
+
+  /** Expires the bound cookie and the unbound marker of ended sessions. */
+  const expireDbscCookies = (
+    ctx: OfferContext,
+    endedTokens: ReadonlySet<string>
+  ) => {
+    for (const token of endedTokens) {
+      const tokenHash = hashToken(token);
+      for (const { name, attributes } of [
+        boundCookieFor(ctx.context, tokenHash),
+        unboundMarkerFor(ctx.context, tokenHash),
+      ]) {
+        ctx.setCookie(name, "", {
+          domain: attributes.domain,
+          httpOnly: attributes.httpOnly,
+          maxAge: 0,
+          path: attributes.path,
+          sameSite: attributes.sameSite,
+          secure: attributes.secure,
+        });
+      }
+    }
+  };
+
+  const afterRequest = createAuthMiddleware(async (ctx) => {
+    const setCookies = responseSetCookies(ctx);
+    const endedTokens = await endedSessionTokens(ctx, setCookies);
+    expireDbscCookies(ctx, endedTokens);
+    issueUnboundMarker(ctx, endedTokens);
     const { newSession } = ctx.context;
     if (newSession && ctx.path !== GET_SESSION_PATH) {
       await offerForNewSession(ctx, newSession.session);
     } else if (ctx.path === GET_SESSION_PATH) {
       await offerDeferred(ctx);
     }
-  });
-
-  const expireOnSignOut = createAuthMiddleware(async (ctx) => {
-    const token = await ctx.getSignedCookie(
-      ctx.context.authCookies.sessionToken.name,
-      ctx.context.secret
-    );
-    if (!token) {
-      return;
-    }
-    const { name, attributes } = boundCookieFor(ctx.context, hashToken(token));
-    ctx.setCookie(name, "", {
-      domain: attributes.domain,
-      httpOnly: attributes.httpOnly,
-      maxAge: 0,
-      path: attributes.path,
-      sameSite: attributes.sameSite,
-      secure: attributes.secure,
-    });
   });
 
   /**
@@ -1214,7 +1525,7 @@ export const dbsc = (options?: DbscOptions) => {
       }
       const tokenHash = hashToken(session.session.token);
       const challengeIssuedAt = verifyChallengeAny(ring, proof.jti, {
-        maxAgeMs: resolvedOptions.challengeMaxAgeMs,
+        maxAgeMs: REGISTRATION_CHALLENGE_TTL_MS,
         now,
         purpose: "r",
         subject: tokenHash,
@@ -1260,6 +1571,19 @@ export const dbsc = (options?: DbscOptions) => {
           ctx.context.logger.warn("[dbsc] Could not sweep bindings", error);
         }
       );
+
+      // Unbound markers rely on a session never becoming bound once its
+      // registration window is over. Checked last, right before the write.
+      const sessionCreatedAt = new Date(session.session.createdAt).getTime();
+      if (!(sessionCreatedAt + REGISTRATION_WINDOW_MS >= Date.now())) {
+        ctx.context.logger.debug(
+          "[dbsc] Registration refused: the session's registration window is over"
+        );
+        return protocolResponse(
+          400,
+          errorBody(DBSC_ERROR_CODES.INVALID_CHALLENGE)
+        );
+      }
 
       const dbscSessionId = createDbscSessionId();
       const created = await createBinding(ctx, {
@@ -1541,12 +1865,8 @@ export const dbsc = (options?: DbscOptions) => {
     hooks: {
       after: [
         {
-          handler: offerRegistration,
+          handler: afterRequest,
           matcher: (ctx) => !isProtocolPath(ctx.path),
-        },
-        {
-          handler: expireOnSignOut,
-          matcher: (ctx) => ctx.path === SIGN_OUT_PATH,
         },
       ],
       before: [
