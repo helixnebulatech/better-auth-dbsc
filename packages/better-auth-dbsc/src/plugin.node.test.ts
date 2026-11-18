@@ -1,8 +1,13 @@
 import type { BetterAuthOptions, BetterAuthPlugin } from "better-auth";
 import { memoryAdapter } from "better-auth/adapters/memory";
 import { createAuthMiddleware, getSessionFromCtx } from "better-auth/api";
-import { parseCookies, setRequestCookie } from "better-auth/cookies";
 import {
+  parseCookies,
+  setRequestCookie,
+  splitSetCookieHeader,
+} from "better-auth/cookies";
+import {
+  admin,
   anonymous,
   bearer,
   multiSession,
@@ -13,6 +18,7 @@ import { getTestInstance } from "better-auth/test";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  BASE_URL,
   Browser,
   parseChallengeHeader,
   parseRegistrationHeader,
@@ -20,9 +26,11 @@ import {
 import { createDeviceKey } from "./__fixtures__/device-key";
 import type { DeviceKey } from "./__fixtures__/device-key";
 import type { DbscAlgorithm } from "./crypto/jwk";
+import { deriveKeys, hashToken } from "./crypto/keys";
 import type { DbscEvent, DbscOptions } from "./options";
 import { dbsc, dbscRefreshNeeded, dbscRefreshPage } from "./plugin";
 import { createSchema, DBSC_MODEL } from "./schema";
+import { createChallenge } from "./tokens";
 
 const AUTH_PREFIX = "/api/auth";
 /** Past the plugin's registration grace (requests in flight are let through). */
@@ -53,6 +61,12 @@ const getSession = async (browser: Browser, cookies?: string) => {
     user?: { email: string };
   } | null;
   return { body, response };
+};
+
+const sessionToken = async (browser: Browser) => {
+  const response = await browser.fetch("/get-session");
+  const body = (await response.json()) as { session: { token: string } };
+  return body.session.token;
 };
 
 const multiCookies = (browser: Browser) =>
@@ -763,6 +777,350 @@ describe("refresh", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* Session end                                                                */
+/* -------------------------------------------------------------------------- */
+
+const boundCookieName = (instructions: Instructions) =>
+  instructions.credentials[0]?.name ?? "";
+
+describe("when Better Auth ends the session", () => {
+  it.each([
+    ["/sign-out", "the session"],
+    ["/revoke-session", "the current session"],
+    ["/revoke-sessions", "every session"],
+    ["/delete-user", "the user"],
+  ])("%s ending %s expires the bound cookie", async (path) => {
+    const { register } = await setup(
+      {},
+      { user: { deleteUser: { enabled: true } } }
+    );
+    const { browser, instructions } = await register();
+    const boundName = boundCookieName(instructions);
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    const token = await sessionToken(browser);
+    const response = await browser.fetch(path, {
+      body: path === "/revoke-session" ? { token } : {},
+    });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(SESSION_COOKIE)).toBeFalsy();
+    expect(browser.cookies.has(boundName)).toBeFalsy();
+    await expect(
+      refreshStatus(browser, instructions.session_identifier)
+    ).resolves.toBe(401);
+  });
+
+  it("revoking another session keeps the current one's bound cookie", async () => {
+    const { register, signIn } = await setup();
+    const { browser, instructions } = await register();
+    const boundName = boundCookieName(instructions);
+    const other = await signIn();
+    const response = await browser.fetch("/revoke-session", {
+      body: { token: await sessionToken(other.browser) },
+    });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(SESSION_COOKIE)).toBeTruthy();
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    await expect(sessionUser(other.browser)).resolves.toBeUndefined();
+  });
+
+  it("a request that fails keeps the bound cookie", async () => {
+    const { register } = await setup(
+      {},
+      { user: { deleteUser: { enabled: true } } }
+    );
+    const { browser, instructions } = await register();
+    const response = await browser.fetch("/delete-user", {
+      body: { password: "not-the-password" },
+    });
+    expect(response.status).toBe(400);
+    expect(browser.cookies.has(boundCookieName(instructions))).toBeTruthy();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+  });
+
+  it.each([
+    ["without a callback", ""],
+    ["with a callback redirect", "&callbackURL=%2Fgoodbye"],
+  ])(
+    "deleting the user through the emailed link %s expires the bound cookie",
+    async (_label, query) => {
+      let deleteToken = "";
+      const { register } = await setup(
+        {},
+        {
+          user: {
+            deleteUser: {
+              enabled: true,
+              sendDeleteAccountVerification: ({ token }) => {
+                deleteToken = token;
+                return Promise.resolve();
+              },
+            },
+          },
+        }
+      );
+      const { browser, instructions } = await register();
+      await browser.fetch("/delete-user", { body: {} });
+      expect(deleteToken).not.toBe("");
+      expect(browser.cookies.has(boundCookieName(instructions))).toBeTruthy();
+      const response = await browser.fetch(
+        `/delete-user/callback?token=${deleteToken}${query}`
+      );
+      expect(response.status).toBe(query ? 302 : 200);
+      expect(browser.cookies.has(SESSION_COOKIE)).toBeFalsy();
+      expect(browser.cookies.has(boundCookieName(instructions))).toBeFalsy();
+    }
+  );
+
+  it("get-session finding the session gone expires the bound cookie", async () => {
+    const { register, instance } = await setup();
+    const { browser, instructions } = await register();
+    const context = await instance.auth.$context;
+    await context.internalAdapter.deleteSession(await sessionToken(browser));
+    await expect(sessionUser(browser)).resolves.toBeUndefined();
+    expect(browser.cookies.has(SESSION_COOKIE)).toBeFalsy();
+    expect(browser.cookies.has(boundCookieName(instructions))).toBeFalsy();
+  });
+
+  it("a response that replaces a session that is gone expires its bound cookie", async () => {
+    const { register, instance, events } = await setup();
+    const { browser, instructions } = await register();
+    const oldToken = await sessionToken(browser);
+    pastRegistrationGrace();
+    // revokeOtherSessions deletes every session, this one included, and
+    // signs the browser in to a new one.
+    const response = await browser.fetch("/change-password", {
+      body: {
+        currentPassword: instance.testUser.password,
+        newPassword: ["a", "new", "password"].join("-"),
+        revokeOtherSessions: true,
+      },
+    });
+    expect(response.status).toBe(200);
+    await expect(sessionToken(browser)).resolves.not.toBe(oldToken);
+    expect(browser.cookies.has(boundCookieName(instructions))).toBeFalsy();
+    // The new session works, and is offered registration like any other.
+    expect(response.headers.get("Secure-Session-Registration")).not.toBeNull();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(events.some((event) => event.type === "proof-missing")).toBeFalsy();
+  });
+
+  it("a response that replaces a session that is gone works with secondary storage", async () => {
+    // Sessions only in secondary storage: Better Auth runs no delete hooks.
+    const store = new Map<string, string>();
+    const { register, instance } = await setup(
+      {},
+      {
+        secondaryStorage: {
+          delete: (key) => {
+            store.delete(key);
+          },
+          get: (key) => store.get(key) ?? null,
+          getAndDelete: (key) => {
+            const value = store.get(key) ?? null;
+            store.delete(key);
+            return value;
+          },
+          increment: (key) => {
+            const next = Number(store.get(key) ?? 0) + 1;
+            store.set(key, String(next));
+            return next;
+          },
+          set: (key, value) => {
+            store.set(key, value);
+          },
+        },
+      }
+    );
+    const { browser, instructions } = await register();
+    pastRegistrationGrace();
+    const response = await browser.fetch("/change-password", {
+      body: {
+        currentPassword: instance.testUser.password,
+        newPassword: ["a", "new", "password"].join("-"),
+        revokeOtherSessions: true,
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(boundCookieName(instructions))).toBeFalsy();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+  });
+
+  it("a response that replaces a session that is still alive keeps its bound cookie", async () => {
+    const { register, signIn } = await setup();
+    const { browser, instructions } = await register();
+    const oldToken = await sessionToken(browser);
+    // Signing in again leaves the old session in the database.
+    await signIn({}, browser);
+    await expect(sessionToken(browser)).resolves.not.toBe(oldToken);
+    expect(browser.cookies.has(boundCookieName(instructions))).toBeTruthy();
+  });
+
+  it("a response that re-sets the same session reads no session", async () => {
+    // A short updateAge makes /get-session refresh the session and set its
+    // cookie again, with the same token.
+    const { signIn, instance } = await setup(
+      {},
+      { session: { updateAge: 60 } }
+    );
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    const context = await instance.auth.$context;
+    const findSession = vi.spyOn(context.internalAdapter, "findSession");
+    const setCookiesBefore = browser.setCookies.length;
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(
+      browser.setCookies
+        .slice(setCookiesBefore)
+        .some((cookie) => cookie.name === SESSION_COOKIE && !cookie.expired)
+    ).toBeTruthy();
+    // Better Auth's own read only.
+    expect(findSession).toHaveBeenCalledOnce();
+    findSession.mockRestore();
+  });
+
+  it("a response that replaces an expired session expires its unbound marker", async () => {
+    const SESSION_EXPIRES_IN_SECONDS = 3600;
+    const { signIn } = await setup(
+      {},
+      { session: { expiresIn: SESSION_EXPIRES_IN_SECONDS } }
+    );
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    await sessionUser(browser);
+    const [markerName = ""] = markerOf(browser) ?? [];
+    expect(markerName).not.toBe("");
+    // The session expires; its row stays until something deletes it, and
+    // the marker (24 hours) outlives it.
+    vi.setSystemTime(Date.now() + SESSION_EXPIRES_IN_SECONDS * 1000);
+    await signIn({}, browser);
+    expect(browser.cookies.has(markerName)).toBeFalsy();
+  });
+
+  it("works with __Secure- cookies", async () => {
+    const { register } = await setup(
+      {},
+      { advanced: { useSecureCookies: true } }
+    );
+    const { browser, instructions } = await register();
+    const boundName = boundCookieName(instructions);
+    expect(boundName.startsWith("__Secure-")).toBeTruthy();
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    await browser.fetch("/revoke-sessions", { body: {} });
+    expect(browser.cookies.has(`__Secure-${SESSION_COOKIE}`)).toBeFalsy();
+    expect(browser.cookies.has(boundName)).toBeFalsy();
+  });
+
+  it("works for server-side auth.api calls", async () => {
+    const { register, instance } = await setup();
+    const { browser, instructions } = await register();
+    const { headers } = await instance.auth.api.revokeSessions({
+      headers: new Headers({ cookie: browser.cookieHeader() }),
+      returnHeaders: true,
+    });
+    const expired = headers
+      .getSetCookie()
+      .filter((cookie) => /max-age=0/iu.test(cookie))
+      .map((cookie) => cookie.slice(0, cookie.indexOf("=")));
+    expect(expired).toContain(SESSION_COOKIE);
+    expect(expired).toContain(boundCookieName(instructions));
+  });
+
+  it("works on runtimes without Headers.getSetCookie", async () => {
+    const { register, instance } = await setup();
+    const { browser, instructions } = await register();
+    const cookie = browser.cookieHeader();
+    const descriptor = Object.getOwnPropertyDescriptor(
+      Headers.prototype,
+      "getSetCookie"
+    );
+    Reflect.deleteProperty(Headers.prototype, "getSetCookie");
+    let response: Response;
+    let setCookie: string;
+    try {
+      // Read the session too: every request runs the after hook.
+      const read = await instance.auth.handler(
+        new Request(`${BASE_URL}${AUTH_PREFIX}/get-session`, {
+          headers: { cookie },
+        })
+      );
+      expect(read.status).toBe(200);
+      response = await instance.auth.handler(
+        new Request(`${BASE_URL}${AUTH_PREFIX}/revoke-sessions`, {
+          body: "{}",
+          headers: {
+            "content-type": "application/json",
+            cookie,
+            origin: BASE_URL,
+          },
+          method: "POST",
+        })
+      );
+      setCookie = response.headers.get("set-cookie") ?? "";
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(Headers.prototype, "getSetCookie", descriptor);
+      }
+    }
+    expect(response.status).toBe(200);
+    const expired = splitSetCookieHeader(setCookie)
+      .filter((entry) => /max-age=0/iu.test(entry))
+      .map((entry) => entry.slice(0, entry.indexOf("=")));
+    expect(expired).toContain(SESSION_COOKIE);
+    expect(expired).toContain(boundCookieName(instructions));
+  });
+
+  it("admin impersonation keeps the admin's bound cookie for the way back", async () => {
+    const { register, instance, handler, events } = await setup(
+      {},
+      { plugins: [admin()] }
+    );
+    const { browser, instructions } = await register();
+    const boundName = boundCookieName(instructions);
+    const context = await instance.auth.$context;
+    const adminSession = await context.internalAdapter.findSession(
+      await sessionToken(browser)
+    );
+    await context.internalAdapter.updateUser(adminSession?.user.id ?? "", {
+      role: "admin",
+    });
+    const target = new Browser(handler);
+    const signUp = await target.fetch("/sign-up/email", {
+      body: {
+        email: ["impersonated", "example.com"].join("@"),
+        name: "impersonated",
+        password: ["impersonated", "account", "password"].join("-"),
+      },
+    });
+    const { user: targetUser } = (await signUp.json()) as {
+      user: { id: string };
+    };
+
+    const impersonate = await browser.fetch("/admin/impersonate-user", {
+      body: { userId: targetUser.id },
+    });
+    expect(impersonate.status).toBe(200);
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    const impersonated = await getSession(browser);
+    expect(impersonated.body?.user?.email).toBe(
+      ["impersonated", "example.com"].join("@")
+    );
+
+    pastRegistrationGrace();
+    const stop = await browser.fetch("/admin/stop-impersonating", {
+      body: {},
+    });
+    expect(stop.status).toBe(200);
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    // Back as the admin, whose session is bound: accepted, not refused.
+    await expect(sessionUser(browser)).resolves.toMatchObject({
+      email: instance.testUser.email,
+    });
+    expect(events.some((event) => event.type === "proof-missing")).toBeFalsy();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* Other plugins                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -828,8 +1186,33 @@ describe("with twoFactor()", () => {
  * kept in localStorage arrive in a `Better-Auth-Cookie` header and are merged
  * into the request's Cookie header.
  */
+const CROSS_DOMAIN_RESPONSE_HEADER = "x-better-auth-cross-domain";
+const carriesCrossDomainCookie = (ctx: { headers?: Headers }) =>
+  Boolean(ctx.headers?.has("better-auth-cookie"));
+
+/**
+ * @convex-dev/better-auth's crossDomain(), cookie handling only: its before
+ * hook reads `Better-Auth-Cookie`, its after hook moves the Set-Cookie
+ * headers set so far to `Set-Better-Auth-Cookie`, and `onResponse` moves the
+ * ones set later (by plugins listed after it, such as dbsc()).
+ */
 const crossDomainLike = (): BetterAuthPlugin => ({
   hooks: {
+    after: [
+      {
+        handler: createAuthMiddleware(async (ctx) => {
+          ctx.setHeader(CROSS_DOMAIN_RESPONSE_HEADER, "1");
+          const setCookie = ctx.context.responseHeaders?.get("set-cookie");
+          if (!setCookie) {
+            return;
+          }
+          ctx.context.responseHeaders?.delete("set-cookie");
+          ctx.setHeader("Set-Better-Auth-Cookie", setCookie);
+          await Promise.resolve();
+        }),
+        matcher: carriesCrossDomainCookie,
+      },
+    ],
     before: [
       {
         handler: createAuthMiddleware(async (ctx) => {
@@ -841,12 +1224,73 @@ const crossDomainLike = (): BetterAuthPlugin => ({
           await Promise.resolve();
           return { context: { headers } };
         }),
-        matcher: (ctx) => Boolean(ctx.headers?.has("better-auth-cookie")),
+        matcher: carriesCrossDomainCookie,
       },
     ],
   },
-  id: "cross-domain-like",
+  id: "cross-domain",
+  onResponse: async (response) => {
+    if (!response.headers.has(CROSS_DOMAIN_RESPONSE_HEADER)) {
+      return;
+    }
+    const headers = new Headers(response.headers);
+    headers.delete(CROSS_DOMAIN_RESPONSE_HEADER);
+    const setCookie = headers.get("set-cookie");
+    if (setCookie) {
+      const moved = headers.get("set-better-auth-cookie");
+      headers.delete("set-cookie");
+      headers.set(
+        "Set-Better-Auth-Cookie",
+        moved ? `${moved}, ${setCookie}` : setCookie
+      );
+    }
+    await Promise.resolve();
+    return {
+      response: new Response(response.body, {
+        headers,
+        status: response.status,
+        statusText: response.statusText,
+      }),
+    };
+  },
 });
+
+/**
+ * A request from a cross-domain client: every cookie of `browser` goes in
+ * `Better-Auth-Cookie`, and the cookies the response sets come back in
+ * `Set-Better-Auth-Cookie`, which is applied to the jar (last one wins).
+ */
+const crossDomainFetch = async (
+  browser: Browser,
+  path: string,
+  body?: unknown
+) => {
+  const response = await browser.fetch(path, {
+    body,
+    cookies: "",
+    headers: { "Better-Auth-Cookie": browser.cookieHeader() },
+  });
+  const moved = splitSetCookieHeader(
+    response.headers.get("set-better-auth-cookie") ?? ""
+  ).map((entry) => {
+    const name = entry.slice(0, entry.indexOf("=")).trim();
+    const expired = /;\s*max-age=0\s*(?:;|$)/iu.test(entry);
+    if (expired) {
+      browser.cookies.delete(name);
+    } else {
+      browser.cookies.set(
+        name,
+        entry.slice(name.length + 1, entry.indexOf(";")).trim()
+      );
+    }
+    return { expired, name };
+  });
+  return { moved, response };
+};
+
+/** Whether the last cookie of that name in `moved` expires it. */
+const expiresIn = (moved: { expired: boolean; name: string }[], name: string) =>
+  moved.findLast((cookie) => cookie.name === name)?.expired === true;
 
 describe("with crossDomain()", () => {
   it("refuses a stolen token carried in Better-Auth-Cookie", async () => {
@@ -869,6 +1313,181 @@ describe("with crossDomain()", () => {
     await expect(response.json()).resolves.toMatchObject({
       user: expect.any(Object),
     });
+  });
+
+  it.each([
+    ["/sign-out", false],
+    ["/revoke-session", true],
+    ["/revoke-sessions", false],
+  ])(
+    "%s expires the bound cookie in Set-Better-Auth-Cookie",
+    async (path, withToken) => {
+      const { register } = await setup({}, { plugins: [crossDomainLike()] });
+      const { browser, instructions } = await register();
+      const boundName = boundCookieName(instructions);
+      const token = await sessionToken(browser);
+      const { moved, response } = await crossDomainFetch(
+        browser,
+        path,
+        withToken ? { token } : {}
+      );
+      expect(response.status).toBe(200);
+      // Everything goes to the cross-domain client, nothing as Set-Cookie.
+      expect(response.headers.getSetCookie()).toStrictEqual([]);
+      expect(expiresIn(moved, SESSION_COOKIE)).toBeTruthy();
+      expect(expiresIn(moved, boundName)).toBeTruthy();
+      expect(browser.cookies.has(boundName)).toBeFalsy();
+    }
+  );
+
+  it("revoke-sessions expires the unbound marker and does not hand it out again", async () => {
+    const { signIn } = await setup({}, { plugins: [crossDomainLike()] });
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    const { moved: issued } = await crossDomainFetch(browser, "/get-session");
+    const markerName = issued.find((cookie) =>
+      cookie.name.includes(UNBOUND_MARKER)
+    )?.name;
+    expect(markerName).toBeDefined();
+    const { moved, response } = await crossDomainFetch(
+      browser,
+      "/revoke-sessions",
+      {}
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toStrictEqual([]);
+    const markerCookies = moved.filter((cookie) => cookie.name === markerName);
+    expect(markerCookies).toStrictEqual([{ expired: true, name: markerName }]);
+  });
+
+  it("a session cookie expired after crossDomain() moved its new value still counts", async () => {
+    // crossDomain() moves the new session cookie of the sign-in, then
+    // twoFactor() (listed after it) expires it as a plain Set-Cookie, which
+    // the client applies last.
+    let otp = "";
+    const { signIn, handler, instance } = await setup(
+      {},
+      {
+        plugins: [
+          crossDomainLike(),
+          twoFactor({
+            otpOptions: {
+              sendOTP: ({ otp: code }) => {
+                otp = code;
+              },
+            },
+            skipVerificationOnEnable: true,
+          }),
+        ],
+      }
+    );
+    const setupBrowser = new Browser(handler);
+    await signIn({}, setupBrowser);
+    const enabled = await setupBrowser.fetch("/two-factor/enable", {
+      body: { password: instance.testUser.password },
+    });
+    expect(enabled.status).toBe(200);
+    // A browser whose session passed 2FA and is bound.
+    const browser = new Browser(handler);
+    await browser.fetch("/sign-in/email", {
+      body: {
+        email: instance.testUser.email,
+        password: instance.testUser.password,
+      },
+    });
+    await browser.fetch("/two-factor/send-otp", { body: {} });
+    const verified = await browser.fetch("/two-factor/verify-otp", {
+      body: { code: otp },
+    });
+    const { instructions } = await completeRegistration(
+      browser,
+      verified,
+      await createDeviceKey()
+    );
+    const boundName = boundCookieName(instructions);
+    expect(browser.cookies.has(boundName)).toBeTruthy();
+    pastRegistrationGrace();
+
+    const { moved, response } = await crossDomainFetch(
+      browser,
+      "/sign-in/email",
+      {
+        email: instance.testUser.email,
+        password: instance.testUser.password,
+      }
+    );
+    await expect(response.json()).resolves.toMatchObject({
+      twoFactorRedirect: true,
+    });
+    expect(expiresIn(moved, SESSION_COOKIE)).toBeTruthy();
+    expect(expiresIn(moved, boundName)).toBeTruthy();
+  });
+
+  it("admin impersonation keeps the admin's bound cookie", async () => {
+    const { register, instance, handler } = await setup(
+      {},
+      { plugins: [crossDomainLike(), admin()] }
+    );
+    const { browser, instructions } = await register();
+    const context = await instance.auth.$context;
+    const adminSession = await context.internalAdapter.findSession(
+      await sessionToken(browser)
+    );
+    await context.internalAdapter.updateUser(adminSession?.user.id ?? "", {
+      role: "admin",
+    });
+    const target = new Browser(handler);
+    const signUp = await target.fetch("/sign-up/email", {
+      body: {
+        email: ["impersonated", "example.com"].join("@"),
+        name: "impersonated",
+        password: ["impersonated", "account", "password"].join("-"),
+      },
+    });
+    const { user } = (await signUp.json()) as { user: { id: string } };
+    const { moved, response } = await crossDomainFetch(
+      browser,
+      "/admin/impersonate-user",
+      { userId: user.id }
+    );
+    expect(response.status).toBe(200);
+    expect(expiresIn(moved, SESSION_COOKIE)).toBeFalsy();
+    expect(
+      moved.some((cookie) => cookie.name === boundCookieName(instructions))
+    ).toBeFalsy();
+  });
+
+  it("multi-session revoke expires the revoked session's bound cookie", async () => {
+    const { register } = await setup(
+      {},
+      { plugins: [crossDomainLike(), multiSession()] }
+    );
+    const first = await register();
+    const { browser } = first;
+    const signUp = await browser.fetch("/sign-up/email", {
+      body: {
+        email: ["second", "example.com"].join("@"),
+        name: "Second",
+        password: ["second", "account", "password"].join("-"),
+      },
+    });
+    const second = await completeRegistration(
+      browser,
+      signUp,
+      await createDeviceKey()
+    );
+    pastRegistrationGrace();
+    const { moved, response } = await crossDomainFetch(
+      browser,
+      "/multi-session/revoke",
+      { sessionToken: await sessionToken(browser) }
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.getSetCookie()).toStrictEqual([]);
+    expect(expiresIn(moved, boundCookieName(second.instructions))).toBeTruthy();
+    expect(
+      browser.cookies.has(boundCookieName(first.instructions))
+    ).toBeTruthy();
   });
 });
 
@@ -922,6 +1541,174 @@ describe("with multiSession()", () => {
   });
 });
 
+describe("with multiSession(), when a session ends", () => {
+  const SECOND_EMAIL = ["second", "example.com"].join("@");
+
+  /** One browser with two bound accounts; the second one is active. */
+  const twoBoundAccounts = async () => {
+    const context = await setup({}, { plugins: [multiSession()] });
+    const first = await context.register();
+    const { browser } = first;
+    const signUp = await browser.fetch("/sign-up/email", {
+      body: {
+        email: SECOND_EMAIL,
+        name: "Second",
+        password: ["second", "account", "password"].join("-"),
+      },
+    });
+    const second = await completeRegistration(
+      browser,
+      signUp,
+      await createDeviceKey()
+    );
+    const secondToken = await sessionToken(browser);
+    const firstToken = [...browser.cookies]
+      .filter(([name]) => name.includes("_multi-"))
+      .map(([, value]) => decodeURIComponent(value).split(".")[0] ?? "")
+      .find((token) => token !== secondToken);
+    expect(firstToken).toBeDefined();
+    pastRegistrationGrace();
+    return {
+      ...context,
+      browser,
+      firstBound: boundCookieName(first.instructions),
+      firstToken: firstToken ?? "",
+      secondBound: boundCookieName(second.instructions),
+      secondToken,
+    };
+  };
+
+  it("revoking the active session expires its bound cookie and keeps the other's", async () => {
+    const { browser, firstBound, secondBound, secondToken, instance, events } =
+      await twoBoundAccounts();
+    const response = await browser.fetch("/multi-session/revoke", {
+      body: { sessionToken: secondToken },
+    });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(secondBound)).toBeFalsy();
+    expect(browser.cookies.has(firstBound)).toBeTruthy();
+    // multiSession() switched to the first account, still bound: accepted.
+    await expect(sessionUser(browser)).resolves.toMatchObject({
+      email: instance.testUser.email,
+    });
+    expect(events.some((event) => event.type === "proof-missing")).toBeFalsy();
+  });
+
+  it("revoking another session expires its bound cookie and keeps the active one's", async () => {
+    const { browser, firstBound, secondBound, firstToken } =
+      await twoBoundAccounts();
+    const response = await browser.fetch("/multi-session/revoke", {
+      body: { sessionToken: firstToken },
+    });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(firstBound)).toBeFalsy();
+    expect(browser.cookies.has(secondBound)).toBeTruthy();
+    await expect(sessionUser(browser)).resolves.toMatchObject({
+      email: SECOND_EMAIL,
+    });
+  });
+
+  it("a failed revoke keeps every bound cookie", async () => {
+    const { browser, firstBound, secondBound } = await twoBoundAccounts();
+    const response = await browser.fetch("/multi-session/revoke", {
+      body: { sessionToken: "not-a-session" },
+    });
+    expect(response.status).toBe(401);
+    expect(browser.cookies.has(firstBound)).toBeTruthy();
+    expect(browser.cookies.has(secondBound)).toBeTruthy();
+  });
+
+  it("switching to a session that is gone expires its bound cookie", async () => {
+    const { browser, firstBound, secondBound, firstToken, instance } =
+      await twoBoundAccounts();
+    const context = await instance.auth.$context;
+    await context.internalAdapter.deleteSession(firstToken);
+    const response = await browser.fetch("/multi-session/set-active", {
+      body: { sessionToken: firstToken },
+    });
+    expect(response.status).toBe(401);
+    expect(browser.cookies.has(firstBound)).toBeFalsy();
+    expect(browser.cookies.has(secondBound)).toBeTruthy();
+  });
+
+  it("sign-out expires every account's bound cookie", async () => {
+    const { browser, firstBound, secondBound } = await twoBoundAccounts();
+    const response = await browser.fetch("/sign-out", { body: {} });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(firstBound)).toBeFalsy();
+    expect(browser.cookies.has(secondBound)).toBeFalsy();
+    expect(
+      [...browser.cookies.keys()].some((name) => name.includes("_multi-"))
+    ).toBeFalsy();
+  });
+
+  it("sign-out matches _multi- cookies the way multiSession() does", async () => {
+    const { browser, firstBound, firstToken } = await twoBoundAccounts();
+    // A `_multi-` cookie under another prefix (say, left from before
+    // useSecureCookies changed): multiSession() still signs it out.
+    const [ownName = "", value = ""] =
+      [...browser.cookies].find(([name]) =>
+        name.endsWith(`_multi-${firstToken.toLowerCase()}`)
+      ) ?? [];
+    browser.cookies.delete(ownName);
+    browser.cookies.set(`legacy_multi-${firstToken.toLowerCase()}`, value);
+    const response = await browser.fetch("/sign-out", { body: {} });
+    expect(response.status).toBe(200);
+    expect(browser.cookies.has(firstBound)).toBeFalsy();
+  });
+
+  it("switching accounts keeps both bound cookies", async () => {
+    const { browser, firstBound, secondBound, firstToken, instance, events } =
+      await twoBoundAccounts();
+    const switched = await browser.fetch("/multi-session/set-active", {
+      body: { sessionToken: firstToken },
+    });
+    expect(switched.status).toBe(200);
+    expect(browser.cookies.has(firstBound)).toBeTruthy();
+    expect(browser.cookies.has(secondBound)).toBeTruthy();
+    await expect(sessionUser(browser)).resolves.toMatchObject({
+      email: instance.testUser.email,
+    });
+    expect(events.some((event) => event.type === "proof-missing")).toBeFalsy();
+  });
+
+  it.each([
+    ["its own", ""],
+    ["another", "legacy"],
+  ])(
+    "signing in again to an account expires its old session's bound cookie (%s _multi- prefix)",
+    async (_label, prefix) => {
+      // multiSession() deletes the account's older sessions in its after
+      // hook, which runs before dbsc()'s.
+      const { browser, firstBound, firstToken, instance } =
+        await twoBoundAccounts();
+      if (prefix) {
+        const [ownName = "", value = ""] =
+          [...browser.cookies].find(([name]) =>
+            name.endsWith(`_multi-${firstToken.toLowerCase()}`)
+          ) ?? [];
+        browser.cookies.delete(ownName);
+        browser.cookies.set(
+          `${prefix}_multi-${firstToken.toLowerCase()}`,
+          value
+        );
+      }
+      const response = await browser.fetch("/sign-in/email", {
+        body: {
+          email: instance.testUser.email,
+          password: instance.testUser.password,
+        },
+      });
+      expect(response.status).toBe(200);
+      const context = await instance.auth.$context;
+      await expect(
+        context.internalAdapter.findSession(firstToken)
+      ).resolves.toBeNull();
+      expect(browser.cookies.has(firstBound)).toBeFalsy();
+    }
+  );
+});
+
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
 /* -------------------------------------------------------------------------- */
@@ -929,9 +1716,6 @@ describe("with multiSession()", () => {
 /* -------------------------------------------------------------------------- */
 /* Audit fixes                                                                */
 /* -------------------------------------------------------------------------- */
-
-const boundCookieName = (instructions: Instructions) =>
-  instructions.credentials[0]?.name ?? "";
 
 describe("robustness", () => {
   it("never rate limits the protocol endpoints (Chrome < 158 deletes on 429)", async () => {
@@ -1192,6 +1976,12 @@ describe("arrivals from other sites", () => {
 });
 
 describe("configuration", () => {
+  it("must come after multiSession()", async () => {
+    await expect(
+      getTestInstance({ plugins: [dbsc(), multiSession()] })
+    ).rejects.toThrow(/after multiSession\(\)/u);
+  });
+
   it("must come after twoFactor()", async () => {
     await expect(
       getTestInstance({ plugins: [dbsc(), twoFactor()] })
@@ -1869,6 +2659,512 @@ describe("binding storage", () => {
     expect(statuses.filter((status) => status === 200)).toHaveLength(
       rows.length
     );
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Unbound marker                                                             */
+/* -------------------------------------------------------------------------- */
+
+const UNBOUND_MARKER = "better-auth.dbsc_unbound_";
+const MINUTE_MS = 60_000;
+/** Deferred offer (5 min 10 s) plus registration challenge (5 min). */
+const REGISTRATION_WINDOW_MS = 10 * MINUTE_MS + 10_000;
+/** Past the window and the wait before the first marker. */
+const PAST_REGISTRATION_WINDOW_MS = REGISTRATION_WINDOW_MS + MINUTE_MS + 1000;
+const ADAPTER_METHODS = [
+  "count",
+  "create",
+  "findMany",
+  "findOne",
+  "update",
+  "updateMany",
+] as const;
+
+const pastRegistrationWindow = () => {
+  vi.setSystemTime(Date.now() + PAST_REGISTRATION_WINDOW_MS);
+};
+
+/** The marker cookie name of the session whose bound cookie is named here. */
+const markerNameOf = (instructions: Instructions) =>
+  boundCookieName(instructions).replace("better-auth.dbsc_", UNBOUND_MARKER);
+
+const markerOf = (browser: Browser) =>
+  [...browser.cookies].find(([name]) => name.startsWith(UNBOUND_MARKER));
+
+const hasMarker = (browser: Browser) => markerOf(browser) !== undefined;
+
+/** Counts the binding lookups made from here on. */
+const countBindingReads = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"]
+) => {
+  const context = await instance.auth.$context;
+  const findOne = vi.spyOn(context.adapter, "findOne");
+  return () =>
+    findOne.mock.calls.filter(([query]) => query.model === DBSC_MODEL).length;
+};
+
+/** Makes the binding write return `delayMs` later. */
+const slowBindingWrites = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"],
+  delayMs: number
+) => {
+  const context = await instance.auth.$context;
+  const create = context.adapter.create.bind(context.adapter);
+  return vi.spyOn(context.adapter, "create").mockImplementation((async (
+    query: Parameters<typeof create>[0]
+  ) => {
+    const created = await create(query);
+    if (query.model === DBSC_MODEL) {
+      vi.setSystemTime(Date.now() + delayMs);
+    }
+    return created;
+  }) as typeof create);
+};
+
+const countBindings = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"]
+) => {
+  const context = await instance.auth.$context;
+  return context.adapter.count({ model: DBSC_MODEL });
+};
+
+/** The session token in a signed session cookie value, unverified. */
+const tokenIn = (value: string | undefined) =>
+  decodeURIComponent(value ?? "").split(".")[0];
+
+describe("unbound marker", () => {
+  it("ends the lookups of a browser without DBSC once its session cannot register", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    const bindingReads = await countBindingReads(instance);
+
+    // While the session could still register, every request asks.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(bindingReads()).toBe(2);
+    expect(hasMarker(browser)).toBeFalsy();
+
+    // Inside the wait that follows the window: still asking.
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + MINUTE_MS / 2);
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(bindingReads()).toBe(3);
+    expect(hasMarker(browser)).toBeFalsy();
+
+    // Past it: one last lookup, which the marker then stands for.
+    vi.setSystemTime(Date.now() + MINUTE_MS);
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(bindingReads()).toBe(4);
+    expect(hasMarker(browser)).toBeTruthy();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    const list = await browser.fetch("/list-sessions");
+    expect(list.status).toBe(200);
+    expect(bindingReads()).toBe(4);
+
+    // The marker lasts a day.
+    vi.setSystemTime(Date.now() + 23 * 60 * MINUTE_MS);
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(bindingReads()).toBe(4);
+    vi.setSystemTime(Date.now() + 2 * 60 * MINUTE_MS);
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(bindingReads()).toBe(5);
+  });
+
+  it("is issued by endpoints behind sessionMiddleware and by server-side reads, without a second lookup", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    const other = await signIn();
+    pastRegistrationWindow();
+    const bindingReads = await countBindingReads(instance);
+
+    const list = await browser.fetch("/list-sessions");
+    expect(list.status).toBe(200);
+    expect(hasMarker(browser)).toBeTruthy();
+    expect(bindingReads()).toBe(1);
+
+    const { headers } = await instance.auth.api.getSession({
+      headers: new Headers({ cookie: other.browser.cookieHeader() }),
+      returnHeaders: true,
+    });
+    expect(headers.getSetCookie().join("\n")).toContain(UNBOUND_MARKER);
+    expect(bindingReads()).toBe(2);
+  });
+
+  it("reads nothing for /get-session with the cookie cache on, bound or not", async () => {
+    const { signIn, register, instance } = await setup(
+      { cookieMaxAge: 1200 },
+      { session: { cookieCache: { enabled: true, maxAge: 1200 } } }
+    );
+    const unbound = await signIn();
+    const bound = await register();
+    pastRegistrationWindow();
+    await expect(sessionUser(unbound.browser)).resolves.toBeDefined();
+    expect(hasMarker(unbound.browser)).toBeTruthy();
+
+    const context = await instance.auth.$context;
+    const spies = ADAPTER_METHODS.map((method) =>
+      vi.spyOn(context.adapter, method)
+    );
+    await expect(sessionUser(unbound.browser)).resolves.toBeDefined();
+    await expect(sessionUser(bound.browser)).resolves.toBeDefined();
+    expect(spies.flatMap((spy) => spy.mock.calls)).toStrictEqual([]);
+    // A bound cookie is not a lookup that found nothing: no marker for it.
+    expect(hasMarker(bound.browser)).toBeFalsy();
+  });
+
+  it("does not exist while the session can still register, so a copy made before the registration stops working at once", async () => {
+    const { signIn, handler } = await setup();
+    const { browser, response } = await signIn();
+    // The page's first requests race Chrome's registration.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    const listed = await browser.fetch("/list-sessions");
+    expect(listed.status).toBe(200);
+    expect(hasMarker(browser)).toBeFalsy();
+    const copied = browser.cookieHeader();
+
+    await completeRegistration(browser, response, await createDeviceKey());
+    const thief = new Browser(handler);
+    await expect(sessionUser(thief, copied)).resolves.toBeUndefined();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+  });
+
+  it("is never issued for a bound session, and only fits its own session", async () => {
+    const { signIn, register, handler } = await setup();
+    const { browser, instructions } = await register();
+    const other = await signIn();
+    pastRegistrationWindow();
+
+    const stolen = sessionCookieOnly(browser);
+    const thief = new Browser(handler);
+    await thief.fetch("/get-session", { cookies: stolen });
+    await thief.fetch("/list-sessions", { cookies: stolen });
+    expect(hasMarker(thief)).toBeFalsy();
+    expect(hasMarker(browser)).toBeFalsy();
+
+    // Another session's marker, under its own name and under the name the
+    // bound session's marker would have.
+    await sessionUser(other.browser);
+    const [otherName = "", otherValue = ""] = markerOf(other.browser) ?? [];
+    expect(otherValue).not.toBe("");
+    await expect(
+      sessionUser(thief, `${stolen}; ${otherName}=${otherValue}`)
+    ).resolves.toBeUndefined();
+    await expect(
+      sessionUser(
+        thief,
+        `${stolen}; ${markerNameOf(instructions)}=${otherValue}`
+      )
+    ).resolves.toBeUndefined();
+  });
+
+  it("does not stand in for the bound cookie, nor the bound cookie for it", async () => {
+    const { signIn, register, instance } = await setup();
+    const { browser, instructions } = await register();
+    const boundValue = browser.cookies.get(boundCookieName(instructions));
+    expect(boundValue).toBeDefined();
+    await expect(
+      sessionUser(
+        browser,
+        `${sessionCookieOnly(browser)}; ${markerNameOf(instructions)}=${boundValue}`
+      )
+    ).resolves.toBeUndefined();
+
+    // A marker under the bound cookie's name proves nothing either: without
+    // the real marker, the lookup happens again.
+    const unbound = await signIn();
+    pastRegistrationWindow();
+    await sessionUser(unbound.browser);
+    const [markerName = "", markerValue = ""] = markerOf(unbound.browser) ?? [];
+    expect(markerValue).not.toBe("");
+    const asBound = markerName.replace(UNBOUND_MARKER, "better-auth.dbsc_");
+    const bindingReads = await countBindingReads(instance);
+    await expect(
+      sessionUser(
+        unbound.browser,
+        `${sessionCookieOnly(unbound.browser)}; ${asBound}=${markerValue}`
+      )
+    ).resolves.toBeDefined();
+    expect(bindingReads()).toBe(1);
+  });
+
+  it("goes on sign-out", async () => {
+    const { signIn } = await setup();
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    await sessionUser(browser);
+    expect(hasMarker(browser)).toBeTruthy();
+    await browser.fetch("/sign-out", { body: {} });
+    expect(hasMarker(browser)).toBeFalsy();
+  });
+
+  it("goes when every session is revoked, and is not handed out again", async () => {
+    const { signIn } = await setup();
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    await sessionUser(browser);
+    expect(hasMarker(browser)).toBeTruthy();
+    const setCookiesBefore = browser.setCookies.length;
+    const response = await browser.fetch("/revoke-sessions", { body: {} });
+    expect(response.status).toBe(200);
+    expect(hasMarker(browser)).toBeFalsy();
+    const markerCookies = browser.setCookies
+      .slice(setCookiesBefore)
+      .filter((cookie) => cookie.name.includes(UNBOUND_MARKER));
+    expect(markerCookies).toHaveLength(1);
+    expect(markerCookies[0]?.expired).toBeTruthy();
+  });
+
+  it("is not handed out by a response that ends the session", async () => {
+    const { signIn } = await setup();
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    // Without a marker, the request is looked up and found unbound, which
+    // would earn it a marker, but the response ends its session.
+    const setCookiesBefore = browser.setCookies.length;
+    const response = await browser.fetch("/revoke-sessions", {
+      body: {},
+      cookies: sessionCookieOnly(browser),
+    });
+    expect(response.status).toBe(200);
+    const markerCookies = browser.setCookies
+      .slice(setCookiesBefore)
+      .filter((cookie) => cookie.name.includes(UNBOUND_MARKER));
+    expect(markerCookies.every((cookie) => cookie.expired)).toBeTruthy();
+    expect(hasMarker(browser)).toBeFalsy();
+  });
+
+  it("is not handed out for a session the response replaces", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    const oldToken = await sessionToken(browser);
+    const setCookiesBefore = browser.setCookies.length;
+    // revokeOtherSessions deletes every session, this one included, and
+    // signs the browser in to a new one.
+    const response = await browser.fetch("/change-password", {
+      body: {
+        currentPassword: instance.testUser.password,
+        newPassword: ["a", "new", "password"].join("-"),
+        revokeOtherSessions: true,
+      },
+      cookies: sessionCookieOnly(browser),
+    });
+    expect(response.status).toBe(200);
+    await expect(sessionToken(browser)).resolves.not.toBe(oldToken);
+    const markersSet = browser.setCookies
+      .slice(setCookiesBefore)
+      .filter(
+        (cookie) => cookie.name.includes(UNBOUND_MARKER) && !cookie.expired
+      );
+    expect(markersSet).toStrictEqual([]);
+  });
+
+  it("is still handed out when the response re-sets the same session", async () => {
+    // A short updateAge makes /get-session refresh the session and set its
+    // cookie again, with the same token.
+    const { signIn } = await setup({}, { session: { updateAge: 60 } });
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    const token = tokenIn(browser.cookies.get(SESSION_COOKIE));
+    const setCookiesBefore = browser.setCookies.length;
+    await sessionUser(browser);
+    const sessionCookies = browser.setCookies
+      .slice(setCookiesBefore)
+      .filter((cookie) => cookie.name === SESSION_COOKIE);
+    expect(sessionCookies.length).toBeGreaterThan(0);
+    expect(sessionCookies.map((cookie) => tokenIn(cookie.value))).toStrictEqual(
+      sessionCookies.map(() => token)
+    );
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("is not handed out on a lookup made while the session could still register", async () => {
+    // A plugin after dbsc() that holds the request after dbsc()'s lookup.
+    let holdMs = 0;
+    const slowRequest: BetterAuthPlugin = {
+      hooks: {
+        before: [
+          {
+            handler: createAuthMiddleware(async () => {
+              if (holdMs > 0) {
+                vi.setSystemTime(Date.now() + holdMs);
+                holdMs = 0;
+              }
+              await Promise.resolve();
+            }),
+            matcher: () => true,
+          },
+        ],
+      },
+      id: "slow-request",
+    };
+    const { signIn } = await setup({}, {}, { after: [slowRequest] });
+    const { browser } = await signIn();
+    // The lookup runs a second before markers are allowed; the response is
+    // sent two minutes later.
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + MINUTE_MS - 1000);
+    holdMs = 2 * MINUTE_MS;
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeFalsy();
+    // The next lookup comes after the cutoff.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("a binding written after the registration deadline is rolled back", async () => {
+    const { signIn, instance, events } = await setup();
+    const { browser, response } = await signIn();
+    const writes = await slowBindingWrites(
+      instance,
+      PAST_REGISTRATION_WINDOW_MS
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    expect(startResponse.status).toBe(400);
+    await expect(countBindings(instance)).resolves.toBe(0);
+    expect(
+      events.some((event) => event.type === "session-registered")
+    ).toBeFalsy();
+    // The session stays, unbound, and can now get its marker.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("a binding written just before the deadline stays", async () => {
+    const { signIn, instance } = await setup();
+    const { browser, response } = await signIn();
+    // The commit deadline is the window plus half the margin.
+    const writes = await slowBindingWrites(
+      instance,
+      REGISTRATION_WINDOW_MS + MINUTE_MS / 2 - 5000
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    expect(startResponse.status).toBe(200);
+    await expect(countBindings(instance)).resolves.toBe(1);
+  });
+
+  it("a late binding that cannot be rolled back revokes its session", async () => {
+    const { signIn, instance } = await setup();
+    const { browser, response } = await signIn();
+    const context = await instance.auth.$context;
+    const deleteMany = context.adapter.deleteMany.bind(context.adapter);
+    const failingRollback = vi
+      .spyOn(context.adapter, "deleteMany")
+      .mockImplementation(((query: Parameters<typeof deleteMany>[0]) => {
+        if (
+          query.model === DBSC_MODEL &&
+          query.where.some((clause) => clause.field === "dbscSessionId")
+        ) {
+          return Promise.reject(new Error("database unavailable"));
+        }
+        return deleteMany(query);
+      }) as typeof deleteMany);
+    const writes = await slowBindingWrites(
+      instance,
+      PAST_REGISTRATION_WINDOW_MS
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    failingRollback.mockRestore();
+    expect(startResponse.status).toBe(400);
+    // Revoking the session also deleted its binding (session-delete hook).
+    await expect(sessionUser(browser)).resolves.toBeUndefined();
+    await expect(countBindings(instance)).resolves.toBe(0);
+  });
+
+  it("spares dbscRefreshNeeded the lookup", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    pastRegistrationWindow();
+    await sessionUser(browser);
+    const bindingReads = await countBindingReads(instance);
+    await expect(
+      dbscRefreshNeeded(
+        instance.auth,
+        crossSiteNavigation(browser.cookieHeader())
+      )
+    ).resolves.toBeFalsy();
+    expect(bindingReads()).toBe(0);
+  });
+});
+
+/**
+ * Registers with a challenge minted now, which no offer would give a session
+ * this old: only the window check in `/dbsc/start` stands in the way.
+ */
+const startWithFreshChallenge = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"],
+  browser: Browser
+) => {
+  const { secret } = await instance.auth.$context;
+  const signed = decodeURIComponent(browser.cookies.get(SESSION_COOKIE) ?? "");
+  const token = signed.slice(0, signed.lastIndexOf("."));
+  const deviceKey = await createDeviceKey();
+  const proof = await deviceKey.prove({
+    jti: createChallenge(deriveKeys(secret), "r", hashToken(token), Date.now())
+      .value,
+    mode: "registration",
+  });
+  return browser.fetch("/dbsc/start", {
+    headers: { "Secure-Session-Response": proof },
+    method: "POST",
+  });
+};
+
+describe("registration window", () => {
+  it("lets a registration challenge live 5 minutes, whatever challengeMaxAge is", async () => {
+    const { signIn } = await setup({ challengeMaxAge: 3600 });
+    const onTime = await signIn();
+    vi.setSystemTime(Date.now() + 4 * MINUTE_MS);
+    const registered = await completeRegistration(
+      onTime.browser,
+      onTime.response,
+      await createDeviceKey()
+    );
+    expect(registered.startResponse.status).toBe(200);
+
+    const late = await signIn();
+    vi.setSystemTime(Date.now() + 5 * MINUTE_MS + 1000);
+    const refused = await completeRegistration(
+      late.browser,
+      late.response,
+      await createDeviceKey()
+    );
+    expect(refused.startResponse.status).toBe(400);
+    expect(refused.instructions).toMatchObject({ code: "INVALID_CHALLENGE" });
+  });
+
+  it("never binds a session past the window, even with a fresh challenge", async () => {
+    const { signIn, instance } = await setup();
+    const inTime = await signIn();
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS - 1000);
+    const bound = await startWithFreshChallenge(instance, inTime.browser);
+    expect(bound.status).toBe(200);
+
+    const late = await signIn();
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + 1000);
+    const refused = await startWithFreshChallenge(instance, late.browser);
+    expect(refused.status).toBe(400);
+    await expect(refused.json()).resolves.toMatchObject({
+      code: "INVALID_CHALLENGE",
+    });
+    await expect(
+      fetchJson(late.browser, "/dbsc/status")
+    ).resolves.toMatchObject({ bound: false });
   });
 });
 

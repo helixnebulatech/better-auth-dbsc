@@ -117,22 +117,18 @@ export const cookieNameTag = (tokenHash: string): string =>
     COOKIE_NAME_TAG_LENGTH
   );
 
-/**
- * `expiresAt.nonce.mac`, MAC over the token hash. Rotates on every refresh
- * (fresh nonce and expiry) and verifies offline: any unexpired value is
- * accepted, which gives in-flight requests the previous-value grace period.
- */
-export const createBoundCookieValue = (
-  keys: DerivedKeys,
+/** `expiresAt.nonce.mac`, MAC over the token hash. */
+const createExpiringMac = (
+  key: Uint8Array,
   tokenHash: string,
   expiresAt: number
 ): string => {
   const prefix = `${expiresAt.toString(RADIX)}.${randomId(NONCE_BYTES)}`;
-  return `${prefix}.${mac(keys.cookie, `${prefix}|${tokenHash}`)}`;
+  return `${prefix}.${mac(key, `${prefix}|${tokenHash}`)}`;
 };
 
-export const verifyBoundCookieValue = (
-  keys: DerivedKeys,
+const verifyExpiringMac = (
+  key: Uint8Array,
   value: string,
   tokenHash: string,
   now: number
@@ -144,16 +140,53 @@ export const verifyBoundCookieValue = (
   const [expiresAtText = "", nonce = "", signature = ""] = parts;
   const prefix = `${expiresAtText}.${nonce}`;
   if (
-    !constantTimeEqualStrings(
-      signature,
-      mac(keys.cookie, `${prefix}|${tokenHash}`)
-    )
+    !constantTimeEqualStrings(signature, mac(key, `${prefix}|${tokenHash}`))
   ) {
     return false;
   }
   const expiresAt = parseTimestamp(expiresAtText);
   return expiresAt !== null && expiresAt > now;
 };
+
+/**
+ * `expiresAt.nonce.mac`, MAC over the token hash. Rotates on every refresh
+ * (fresh nonce and expiry) and verifies offline: any unexpired value is
+ * accepted, which gives in-flight requests the previous-value grace period.
+ */
+export const createBoundCookieValue = (
+  keys: DerivedKeys,
+  tokenHash: string,
+  expiresAt: number
+): string => createExpiringMac(keys.cookie, tokenHash, expiresAt);
+
+export const verifyBoundCookieValue = (
+  keys: DerivedKeys,
+  value: string,
+  tokenHash: string,
+  now: number
+): boolean => verifyExpiringMac(keys.cookie, value, tokenHash, now);
+
+/* -------------------------------------------------------------------------- */
+/* Unbound marker                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The server's own note that a lookup found no binding for this session
+ * token, so the following requests can skip that lookup. Same shape as the
+ * bound cookie, under its own key: neither verifies as the other.
+ */
+export const createUnboundMarkerValue = (
+  keys: DerivedKeys,
+  tokenHash: string,
+  expiresAt: number
+): string => createExpiringMac(keys.unbound, tokenHash, expiresAt);
+
+export const verifyUnboundMarkerValue = (
+  keys: DerivedKeys,
+  value: string,
+  tokenHash: string,
+  now: number
+): boolean => verifyExpiringMac(keys.unbound, value, tokenHash, now);
 
 /* -------------------------------------------------------------------------- */
 /* Session token at rest                                                      */

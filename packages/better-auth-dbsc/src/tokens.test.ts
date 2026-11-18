@@ -5,12 +5,14 @@ import {
   cookieNameTag,
   createBoundCookieValue,
   createChallenge,
+  createUnboundMarkerValue,
   decryptSessionToken,
   encryptSessionToken,
   openRegistrationTicket,
   sealRegistrationTicket,
   verifyBoundCookieValue,
   verifyChallenge,
+  verifyUnboundMarkerValue,
 } from "./tokens";
 
 const keys = deriveKeys("k1-".repeat(12));
@@ -68,6 +70,24 @@ describe("bound cookie", () => {
     const [, nonce, mac] = value.split(".");
     const extended = `${(NOW + 99 * MINUTE).toString(36)}.${nonce}.${mac}`;
     expect(verifyBoundCookieValue(keys, extended, "hash", NOW)).toBeFalsy();
+  });
+
+  it("and the unbound marker never verify as each other", () => {
+    const expiresAt = NOW + 10 * MINUTE;
+    const bound = createBoundCookieValue(keys, "hash", expiresAt);
+    const marker = createUnboundMarkerValue(keys, "hash", expiresAt);
+    expect(verifyUnboundMarkerValue(keys, marker, "hash", NOW)).toBeTruthy();
+    expect(verifyUnboundMarkerValue(keys, bound, "hash", NOW)).toBeFalsy();
+    expect(verifyBoundCookieValue(keys, marker, "hash", NOW)).toBeFalsy();
+    expect(
+      verifyUnboundMarkerValue(keys, marker, "other-hash", NOW)
+    ).toBeFalsy();
+    expect(
+      verifyUnboundMarkerValue(keys, marker, "hash", expiresAt)
+    ).toBeFalsy();
+    expect(
+      verifyUnboundMarkerValue(otherKeys, marker, "hash", NOW)
+    ).toBeFalsy();
   });
 
   it("rotates on every issue", () => {
