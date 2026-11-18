@@ -141,6 +141,13 @@ const REGISTRATION_WINDOW_MS =
  */
 const UNBOUND_MARKER_MARGIN_MS = 60 * 1000;
 /**
+ * A registration whose binding write returns later than this after the
+ * session was created is rolled back: its row could otherwise land after
+ * an unbound marker was issued. Half the margin is left for replica lag.
+ */
+const REGISTRATION_COMMIT_DEADLINE_MS =
+  REGISTRATION_WINDOW_MS + UNBOUND_MARKER_MARGIN_MS / 2;
+/**
  * Lifetime of an unbound marker. What it says stays true, so this only
  * limits how long the marker of a replaced session lingers in the browser.
  */
@@ -535,6 +542,41 @@ const findRivals = (
  * one that inserted second always sees the first, so two can never both win
  * (in a full overlap both back out and the session stays unbound).
  */
+/**
+ * Undoes a binding whose write returned after the registration deadline. If
+ * the binding cannot be deleted, the session is: a bound session must never
+ * coexist with an unbound marker issued before its binding landed.
+ */
+const rollBackLateRegistration = async (
+  ctx: GenericEndpointContext,
+  dbscSessionId: string,
+  sessionToken: string
+) => {
+  ctx.context.logger.warn(
+    "[dbsc] Registration rolled back: its binding was written after the registration deadline"
+  );
+  try {
+    await ctx.context.adapter.deleteMany({
+      model: DBSC_MODEL,
+      where: [{ field: "dbscSessionId", value: dbscSessionId }],
+    });
+    return;
+  } catch (error) {
+    ctx.context.logger.error(
+      "[dbsc] Could not roll back a late binding; revoking its session",
+      error
+    );
+  }
+  try {
+    await ctx.context.internalAdapter.deleteSession(sessionToken);
+  } catch (error) {
+    ctx.context.logger.error(
+      "[dbsc] Could not revoke the session of a late binding",
+      error
+    );
+  }
+};
+
 const createBinding = async (
   ctx: GenericEndpointContext,
   data: Omit<DbscSessionRecord, "id">
@@ -904,10 +946,15 @@ export const dbsc = (options?: DbscOptions) => {
     Map<string, Promise<DbscSessionRecord | null>>
   >();
   /**
-   * The session tokens a request's lookups found unbound, from the before
-   * hook to the after hook, which knows the session's age.
+   * The session tokens a request's lookups found unbound, and when those
+   * lookups started, from the before hook to the after hook, which knows the
+   * session's age. The lookup time counts, not the response time: a lookup
+   * made while the session could still register says nothing about later.
    */
-  const foundUnboundByRequest = new WeakMap<Headers, Set<string>>();
+  const foundUnboundByRequest = new WeakMap<
+    Headers,
+    { lookedUpAt: number; tokens: Set<string> }
+  >();
   /** When each HTTP request reached the plugin, to tell new sessions apart. */
   const requestStarts = new WeakMap<Request, number>();
 
@@ -1108,6 +1155,7 @@ export const dbsc = (options?: DbscOptions) => {
       sessionCookieName,
       sources,
     });
+    const lookedUpAt = Date.now();
     const { foundUnbound, refused } = await checkTokens(
       ctx,
       cookies,
@@ -1115,7 +1163,7 @@ export const dbsc = (options?: DbscOptions) => {
       tokensByName
     );
     if (foundUnbound.size > 0) {
-      foundUnboundByRequest.set(headers, foundUnbound);
+      foundUnboundByRequest.set(headers, { lookedUpAt, tokens: foundUnbound });
     }
     const dropped = new Set(overLimit);
     for (const [name, tokens] of tokensByName) {
@@ -1302,13 +1350,13 @@ export const dbsc = (options?: DbscOptions) => {
     endedTokens: ReadonlySet<string>
   ) => {
     const session = ctx.context.session?.session;
+    const lookup = ctx.headers && foundUnboundByRequest.get(ctx.headers);
     if (
       !(
         session &&
+        lookup?.tokens.has(session.token) &&
         // Not for a session this response ends.
-        !endedTokens.has(session.token) &&
-        ctx.headers &&
-        foundUnboundByRequest.get(ctx.headers)?.has(session.token)
+        !endedTokens.has(session.token)
       )
     ) {
       return;
@@ -1318,8 +1366,9 @@ export const dbsc = (options?: DbscOptions) => {
       new Date(session.createdAt).getTime() +
       REGISTRATION_WINDOW_MS +
       UNBOUND_MARKER_MARGIN_MS;
-    // Also false for a session without a usable creation time.
-    if (!(markerAllowedAt < now)) {
+    // The lookup itself must come after the window and margin. Also false
+    // for a session without a usable creation time.
+    if (!(markerAllowedAt < lookup.lookedUpAt)) {
       return;
     }
     const tokenHash = hashToken(session.token);
@@ -1607,6 +1656,20 @@ export const dbsc = (options?: DbscOptions) => {
       });
       if (!created) {
         return protocolResponse(400, errorBody(DBSC_ERROR_CODES.ALREADY_BOUND));
+      }
+      // The window check ran before the write. A write that returns this
+      // late may have landed after an unbound marker was issued for the
+      // session, so the registration is undone.
+      if (!(Date.now() <= sessionCreatedAt + REGISTRATION_COMMIT_DEADLINE_MS)) {
+        await rollBackLateRegistration(
+          ctx,
+          dbscSessionId,
+          session.session.token
+        );
+        return protocolResponse(
+          400,
+          errorBody(DBSC_ERROR_CODES.INVALID_CHALLENGE)
+        );
       }
 
       await emit(ctx, {

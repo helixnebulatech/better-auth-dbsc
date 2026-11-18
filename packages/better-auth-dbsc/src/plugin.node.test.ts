@@ -2704,6 +2704,31 @@ const countBindingReads = async (
     findOne.mock.calls.filter(([query]) => query.model === DBSC_MODEL).length;
 };
 
+/** Makes the binding write return `delayMs` later. */
+const slowBindingWrites = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"],
+  delayMs: number
+) => {
+  const context = await instance.auth.$context;
+  const create = context.adapter.create.bind(context.adapter);
+  return vi.spyOn(context.adapter, "create").mockImplementation((async (
+    query: Parameters<typeof create>[0]
+  ) => {
+    const created = await create(query);
+    if (query.model === DBSC_MODEL) {
+      vi.setSystemTime(Date.now() + delayMs);
+    }
+    return created;
+  }) as typeof create);
+};
+
+const countBindings = async (
+  instance: Awaited<ReturnType<typeof setup>>["instance"]
+) => {
+  const context = await instance.auth.$context;
+  return context.adapter.count({ model: DBSC_MODEL });
+};
+
 /** The session token in a signed session cookie value, unverified. */
 const tokenIn = (value: string | undefined) =>
   decodeURIComponent(value ?? "").split(".")[0];
@@ -2952,6 +2977,113 @@ describe("unbound marker", () => {
       sessionCookies.map(() => token)
     );
     expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("is not handed out on a lookup made while the session could still register", async () => {
+    // A plugin after dbsc() that holds the request after dbsc()'s lookup.
+    let holdMs = 0;
+    const slowRequest: BetterAuthPlugin = {
+      hooks: {
+        before: [
+          {
+            handler: createAuthMiddleware(async () => {
+              if (holdMs > 0) {
+                vi.setSystemTime(Date.now() + holdMs);
+                holdMs = 0;
+              }
+              await Promise.resolve();
+            }),
+            matcher: () => true,
+          },
+        ],
+      },
+      id: "slow-request",
+    };
+    const { signIn } = await setup({}, {}, { after: [slowRequest] });
+    const { browser } = await signIn();
+    // The lookup runs a second before markers are allowed; the response is
+    // sent two minutes later.
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + MINUTE_MS - 1000);
+    holdMs = 2 * MINUTE_MS;
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeFalsy();
+    // The next lookup comes after the cutoff.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("a binding written after the registration deadline is rolled back", async () => {
+    const { signIn, instance, events } = await setup();
+    const { browser, response } = await signIn();
+    const writes = await slowBindingWrites(
+      instance,
+      PAST_REGISTRATION_WINDOW_MS
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    expect(startResponse.status).toBe(400);
+    await expect(countBindings(instance)).resolves.toBe(0);
+    expect(
+      events.some((event) => event.type === "session-registered")
+    ).toBeFalsy();
+    // The session stays, unbound, and can now get its marker.
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
+  it("a binding written just before the deadline stays", async () => {
+    const { signIn, instance } = await setup();
+    const { browser, response } = await signIn();
+    // The commit deadline is the window plus half the margin.
+    const writes = await slowBindingWrites(
+      instance,
+      REGISTRATION_WINDOW_MS + MINUTE_MS / 2 - 5000
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    expect(startResponse.status).toBe(200);
+    await expect(countBindings(instance)).resolves.toBe(1);
+  });
+
+  it("a late binding that cannot be rolled back revokes its session", async () => {
+    const { signIn, instance } = await setup();
+    const { browser, response } = await signIn();
+    const context = await instance.auth.$context;
+    const deleteMany = context.adapter.deleteMany.bind(context.adapter);
+    const failingRollback = vi
+      .spyOn(context.adapter, "deleteMany")
+      .mockImplementation(((query: Parameters<typeof deleteMany>[0]) => {
+        if (
+          query.model === DBSC_MODEL &&
+          query.where.some((clause) => clause.field === "dbscSessionId")
+        ) {
+          return Promise.reject(new Error("database unavailable"));
+        }
+        return deleteMany(query);
+      }) as typeof deleteMany);
+    const writes = await slowBindingWrites(
+      instance,
+      PAST_REGISTRATION_WINDOW_MS
+    );
+    const { startResponse } = await completeRegistration(
+      browser,
+      response,
+      await createDeviceKey()
+    );
+    writes.mockRestore();
+    failingRollback.mockRestore();
+    expect(startResponse.status).toBe(400);
+    // Revoking the session also deleted its binding (session-delete hook).
+    await expect(sessionUser(browser)).resolves.toBeUndefined();
+    await expect(countBindings(instance)).resolves.toBe(0);
   });
 
   it("spares dbscRefreshNeeded the lookup", async () => {
