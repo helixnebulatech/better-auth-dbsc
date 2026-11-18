@@ -3048,6 +3048,33 @@ describe("unbound marker", () => {
     expect(hasMarker(browser)).toBeTruthy();
   });
 
+  it("is not handed out when the lookup itself starts before the cutoff", async () => {
+    const { signIn, instance } = await setup();
+    const { browser } = await signIn();
+    // The binding read starts a second before markers are allowed, and the
+    // adapter spends two minutes before returning its promise.
+    vi.setSystemTime(Date.now() + REGISTRATION_WINDOW_MS + MINUTE_MS - 1000);
+    const context = await instance.auth.$context;
+    const findOne = context.adapter.findOne.bind(context.adapter);
+    let held = false;
+    const slowStart = vi.spyOn(context.adapter, "findOne").mockImplementation(((
+      query: Parameters<typeof findOne>[0]
+    ) => {
+      const pending = findOne(query);
+      if (query.model === DBSC_MODEL && !held) {
+        held = true;
+        vi.setSystemTime(Date.now() + 2 * MINUTE_MS);
+      }
+      return pending;
+    }) as typeof findOne);
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    slowStart.mockRestore();
+    expect(held).toBeTruthy();
+    expect(hasMarker(browser)).toBeFalsy();
+    await expect(sessionUser(browser)).resolves.toBeDefined();
+    expect(hasMarker(browser)).toBeTruthy();
+  });
+
   it("a binding written after the registration deadline is rolled back", async () => {
     const { signIn, instance, events } = await setup();
     const { browser, response } = await signIn();

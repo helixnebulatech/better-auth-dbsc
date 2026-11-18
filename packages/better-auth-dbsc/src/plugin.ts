@@ -994,13 +994,16 @@ export const dbsc = (options?: DbscOptions) => {
     field: "tokenHash" | "dbscSessionId",
     value: string
   ): BindingLookup => {
-    const lookup = (): BindingLookup => ({
-      binding: ctx.context.adapter.findOne<DbscSessionRecord>({
+    const lookup = (): BindingLookup => {
+      // Taken before the call: the read happens at or after this time, even
+      // when the adapter does synchronous work before returning.
+      const startedAt = Date.now();
+      const binding = ctx.context.adapter.findOne<DbscSessionRecord>({
         model: DBSC_MODEL,
         where: [{ field, value }],
-      }),
-      startedAt: Date.now(),
-    });
+      });
+      return { binding, startedAt };
+    };
     const request = field === "tokenHash" ? ctx.request : undefined;
     if (!request) {
       return lookup();
