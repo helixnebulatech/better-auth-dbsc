@@ -490,6 +490,12 @@ const sweepDeadBindings = async (
 };
 
 /** Bindings younger than the registration grace still accept the cookie alone. */
+/** A binding lookup and when it started. */
+interface BindingLookup {
+  binding: Promise<DbscSessionRecord | null>;
+  startedAt: number;
+}
+
 const inRegistrationGrace = (binding: DbscSessionRecord, now: number) =>
   new Date(binding.createdAt).getTime() + REGISTRATION_GRACE_MS > now;
 
@@ -941,20 +947,15 @@ export const dbsc = (options?: DbscOptions) => {
    * Binding lookups made while handling one HTTP request. The pending read
    * is cached, so concurrent checks of one token share a single query.
    */
-  const lookupCache = new WeakMap<
-    Request,
-    Map<string, Promise<DbscSessionRecord | null>>
-  >();
+  const lookupCache = new WeakMap<Request, Map<string, BindingLookup>>();
   /**
-   * The session tokens a request's lookups found unbound, and when those
-   * lookups started, from the before hook to the after hook, which knows the
-   * session's age. The lookup time counts, not the response time: a lookup
-   * made while the session could still register says nothing about later.
+   * The session tokens a request's lookups found unbound, each with the time
+   * its lookup started, from the before hook to the after hook, which knows
+   * the session's age. The lookup time counts, not the response time, and a
+   * cached lookup keeps the time it was made: a lookup made while the
+   * session could still register says nothing about later.
    */
-  const foundUnboundByRequest = new WeakMap<
-    Headers,
-    { lookedUpAt: number; tokens: Set<string> }
-  >();
+  const foundUnboundByRequest = new WeakMap<Headers, Map<string, number>>();
   /** When each HTTP request reached the plugin, to tell new sessions apart. */
   const requestStarts = new WeakMap<Request, number>();
 
@@ -984,16 +985,25 @@ export const dbsc = (options?: DbscOptions) => {
       resolvedOptions.cookieMaxAgeMs / MS_PER_SECOND
     );
 
-  const findBinding = (
+  /**
+   * A binding lookup and when it started. Lookups by token hash are shared
+   * within a request, and keep the start time of the read that was made.
+   */
+  const lookUpBinding = (
     ctx: AnyContext,
     field: "tokenHash" | "dbscSessionId",
     value: string
-  ): Promise<DbscSessionRecord | null> => {
-    const lookup = () =>
-      ctx.context.adapter.findOne<DbscSessionRecord>({
+  ): BindingLookup => {
+    const lookup = (): BindingLookup => {
+      // Taken before the call: the read happens at or after this time, even
+      // when the adapter does synchronous work before returning.
+      const startedAt = Date.now();
+      const binding = ctx.context.adapter.findOne<DbscSessionRecord>({
         model: DBSC_MODEL,
         where: [{ field, value }],
       });
+      return { binding, startedAt };
+    };
     const request = field === "tokenHash" ? ctx.request : undefined;
     if (!request) {
       return lookup();
@@ -1010,9 +1020,16 @@ export const dbsc = (options?: DbscOptions) => {
     const pending = lookup();
     perRequest.set(value, pending);
     // A failed read is not remembered: the next check asks again.
-    pending.catch(() => perRequest.delete(value));
+    pending.binding.catch(() => perRequest.delete(value));
     return pending;
   };
+
+  const findBinding = (
+    ctx: AnyContext,
+    field: "tokenHash" | "dbscSessionId",
+    value: string
+  ): Promise<DbscSessionRecord | null> =>
+    lookUpBinding(ctx, field, value).binding;
 
   /**
    * Whether the token may be used for this request. It may when the request
@@ -1027,25 +1044,29 @@ export const dbsc = (options?: DbscOptions) => {
     cookies: Map<string, string>,
     ring: Keyring,
     token: string
-  ): Promise<"allowed" | "found-unbound" | "refused"> => {
+  ): Promise<
+    | { verdict: "allowed" | "refused" }
+    | { lookedUpAt: number; verdict: "found-unbound" }
+  > => {
     const tokenHash = hashToken(token);
     const now = Date.now();
     const boundCookie = cookies.get(
       boundCookieFor(ctx.context, tokenHash).name
     );
     if (boundCookie && boundCookieIsValid(ring, boundCookie, tokenHash, now)) {
-      return "allowed";
+      return { verdict: "allowed" };
     }
     const marker = cookies.get(unboundMarkerFor(ctx.context, tokenHash).name);
     if (marker && unboundMarkerIsValid(ring, marker, tokenHash, now)) {
-      return "allowed";
+      return { verdict: "allowed" };
     }
-    const binding = await findBinding(ctx, "tokenHash", tokenHash);
+    const lookup = lookUpBinding(ctx, "tokenHash", tokenHash);
+    const binding = await lookup.binding;
     if (!binding) {
-      return "found-unbound";
+      return { lookedUpAt: lookup.startedAt, verdict: "found-unbound" };
     }
     if (inRegistrationGrace(binding, now)) {
-      return "allowed";
+      return { verdict: "allowed" };
     }
     await emit(ctx, {
       path: ctx.path,
@@ -1053,7 +1074,7 @@ export const dbsc = (options?: DbscOptions) => {
       type: "proof-missing",
       userId: binding.userId,
     });
-    return "refused";
+    return { verdict: "refused" };
   };
 
   const mayUseToken = async (
@@ -1061,7 +1082,10 @@ export const dbsc = (options?: DbscOptions) => {
     cookies: Map<string, string>,
     ring: Keyring,
     token: string
-  ) => (await checkToken(ctx, cookies, ring, token)) !== "refused";
+  ) => {
+    const { verdict } = await checkToken(ctx, cookies, ring, token);
+    return verdict !== "refused";
+  };
 
   /* ------------------------------------------------------------------------ */
   /* Enforcement                                                              */
@@ -1105,14 +1129,15 @@ export const dbsc = (options?: DbscOptions) => {
       [...tokensByName.values()].flatMap((tokens) => [...tokens])
     );
     const refused = new Set<string>();
-    const foundUnbound = new Set<string>();
+    /** Token → when the lookup that found it unbound started. */
+    const foundUnbound = new Map<string, number>();
     await Promise.all(
       [...unique].map(async (token) => {
-        const verdict = await checkToken(ctx, cookies, ring, token);
-        if (verdict === "refused") {
+        const result = await checkToken(ctx, cookies, ring, token);
+        if (result.verdict === "refused") {
           refused.add(token);
-        } else if (verdict === "found-unbound") {
-          foundUnbound.add(token);
+        } else if (result.verdict === "found-unbound") {
+          foundUnbound.set(token, result.lookedUpAt);
         }
       })
     );
@@ -1155,7 +1180,6 @@ export const dbsc = (options?: DbscOptions) => {
       sessionCookieName,
       sources,
     });
-    const lookedUpAt = Date.now();
     const { foundUnbound, refused } = await checkTokens(
       ctx,
       cookies,
@@ -1163,7 +1187,7 @@ export const dbsc = (options?: DbscOptions) => {
       tokensByName
     );
     if (foundUnbound.size > 0) {
-      foundUnboundByRequest.set(headers, { lookedUpAt, tokens: foundUnbound });
+      foundUnboundByRequest.set(headers, foundUnbound);
     }
     const dropped = new Set(overLimit);
     for (const [name, tokens] of tokensByName) {
@@ -1350,11 +1374,14 @@ export const dbsc = (options?: DbscOptions) => {
     endedTokens: ReadonlySet<string>
   ) => {
     const session = ctx.context.session?.session;
-    const lookup = ctx.headers && foundUnboundByRequest.get(ctx.headers);
+    const lookedUpAt =
+      session &&
+      ctx.headers &&
+      foundUnboundByRequest.get(ctx.headers)?.get(session.token);
     if (
       !(
         session &&
-        lookup?.tokens.has(session.token) &&
+        lookedUpAt !== undefined &&
         // Not for a session this response ends.
         !endedTokens.has(session.token)
       )
@@ -1368,7 +1395,7 @@ export const dbsc = (options?: DbscOptions) => {
       UNBOUND_MARKER_MARGIN_MS;
     // The lookup itself must come after the window and margin. Also false
     // for a session without a usable creation time.
-    if (!(markerAllowedAt < lookup.lookedUpAt)) {
+    if (!(markerAllowedAt < lookedUpAt)) {
       return;
     }
     const tokenHash = hashToken(session.token);
